@@ -18,7 +18,7 @@ export const hashToCurve = (secret: Buffer): Uint8Array => {
 
   for (let counter = 0; counter < 2 ** 16; counter++) {
     const counterBuf = Buffer.alloc(4)
-    counterBuf.writeUInt32BE(counter)
+    counterBuf.writeUInt32LE(counter)
     const candidate = Buffer.concat([
       Buffer.from([0x02]),
       crypto.createHash("sha256").update(Buffer.concat([msgHash, counterBuf])).digest(),
@@ -37,6 +37,11 @@ export const hashToCurve = (secret: Buffer): Uint8Array => {
  *                   Throws CashuInsufficientSlotsError if the split would require more.
  */
 export const splitIntoDenominations = (total: number, maxSlots?: number): number[] => {
+  // Input validation — reject non-finite, negative, or fractional values
+  if (!Number.isFinite(total) || total < 0 || !Number.isInteger(total)) {
+    throw new Error(`splitIntoDenominations: invalid amount ${total}`)
+  }
+
   const denominations: number[] = []
   let remaining = total
   for (let bit = 15; bit >= 0; bit--) {
@@ -61,7 +66,13 @@ export const splitIntoDenominations = (total: number, maxSlots?: number): number
  * secret = ["P2PK", {"nonce": "<hex>", "data": "<cardPubkey>", "tags": [["sigflag", "SIG_INPUTS"]]}]
  */
 export const buildP2PKSecret = (nonce: string, cardPubkey: string): string => {
-  return `["P2PK",{"nonce":"${nonce}","data":"${cardPubkey}","tags":[["sigflag","SIG_INPUTS"]]}]`
+  // Use structured serialization to prevent injection via raw string interpolation
+  const secret = ["P2PK", {
+    nonce: nonce,
+    data: cardPubkey,
+    tags: [["sigflag", "SIG_INPUTS"]],
+  }]
+  return JSON.stringify(secret)
 }
 
 /**
@@ -77,6 +88,12 @@ export const createBlindedMessage = (
 ): CashuBlindingData => {
   const nonce = crypto.randomBytes(32)
   const nonceHex = nonce.toString("hex")
+
+  // Validate card pubkey is a valid compressed secp256k1 point
+  const cardPubBytes = Buffer.from(cardPubkey, "hex")
+  if (!secp.isPoint(cardPubBytes)) {
+    throw new Error(`createBlindedMessage: cardPubkey is not a valid secp256k1 point`)
+  }
 
   const secretStr = buildP2PKSecret(nonceHex, cardPubkey)
   const secretBytes = Buffer.from(secretStr, "utf8")
@@ -117,6 +134,14 @@ export const unblindSignature = (
 ): string => {
   const C_ = Buffer.from(C_hex, "hex")
   const K = Buffer.from(mintPubkeyHex, "hex")
+
+  // Validate inputs are valid compressed secp256k1 points
+  if (!secp.isPoint(C_)) {
+    throw new Error("unblindSignature: C_ is not a valid secp256k1 point")
+  }
+  if (!secp.isPoint(K)) {
+    throw new Error("unblindSignature: mintPubkey is not a valid secp256k1 point")
+  }
 
   const rK = secp.pointMultiply(K, r, true)
   if (!rK) throw new Error("pointMultiply failed for r*K")

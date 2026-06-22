@@ -77,6 +77,22 @@ describe("splitIntoDenominations", () => {
     expect(splitIntoDenominations(0)).toEqual([])
   })
 
+  it("throws on negative numbers", () => {
+    expect(() => splitIntoDenominations(-1)).toThrow(/invalid amount/)
+  })
+
+  it("throws on fractional values", () => {
+    expect(() => splitIntoDenominations(1.5)).toThrow(/invalid amount/)
+  })
+
+  it("throws on NaN", () => {
+    expect(() => splitIntoDenominations(NaN)).toThrow(/invalid amount/)
+  })
+
+  it("throws on Infinity", () => {
+    expect(() => splitIntoDenominations(Infinity)).toThrow(/invalid amount/)
+  })
+
   it("throws CashuInsufficientSlotsError when maxSlots is exceeded", () => {
     // 100 = [64, 32, 4] = 3 denominations; maxSlots=2 should throw
     const { CashuInsufficientSlotsError } = require("../src")
@@ -177,5 +193,28 @@ describe("createBlindedMessage + unblindSignature", () => {
 
     expect(bd1.nonce).not.toBe(bd2.nonce)
     expect(bd1.B_).not.toBe(bd2.B_)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Input validation: invalid pubkeys
+// ---------------------------------------------------------------------------
+
+describe("Input validation", () => {
+  it("createBlindedMessage rejects invalid card pubkey", () => {
+    expect(() => createBlindedMessage("0059534ce0bfa19a", 1, "not-a-valid-pubkey")).toThrow(/not a valid secp256k1 point/)
+  })
+
+  it("createBlindedMessage rejects truncated hex", () => {
+    expect(() => createBlindedMessage("0059534ce0bfa19a", 1, "02a9")).toThrow(/not a valid secp256k1 point/)
+  })
+
+  it("unblindSignature rejects invalid C_", () => {
+    expect(() => unblindSignature("invalid", new Uint8Array(32), "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2")).toThrow(/not a valid secp256k1 point/)
+  })
+
+  it("unblindSignature rejects invalid mint pubkey", () => {
+    const validC = "02" + "a".repeat(64)
+    expect(() => unblindSignature(validC.slice(0, 66), new Uint8Array(32), "bad-key")).toThrow(/not a valid secp256k1 point/)
   })
 })
