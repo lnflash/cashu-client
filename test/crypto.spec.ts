@@ -22,6 +22,26 @@ describe("hashToCurve", () => {
     expect(point[0] === 0x02 || point[0] === 0x03).toBe(true)
   })
 
+  // Official NUT-00 hash_to_curve known-answer vectors. These pin spec
+  // conformance (interop with other Cashu implementations) — the round-trip
+  // tests only prove self-consistency and would pass even with an endianness
+  // regression.
+  it("matches NUT-00 test vector: 0x00*32", () => {
+    const point = hashToCurve(Buffer.alloc(32, 0x00))
+    expect(Buffer.from(point).toString("hex")).toBe(
+      "024cce997d3b518f739663b757deaec95bcd9473c30a14ac2fd04023a739d1a725",
+    )
+  })
+
+  it("matches NUT-00 test vector: 0x00..01", () => {
+    const secret = Buffer.alloc(32, 0x00)
+    secret[31] = 0x01
+    const point = hashToCurve(secret)
+    expect(Buffer.from(point).toString("hex")).toBe(
+      "022e7158e11c9506f1aa4248bf531298daa7febd6194f003edcd9b93ade6253acf",
+    )
+  })
+
   it("returns a valid point for a random input", () => {
     const secret = crypto.randomBytes(32)
     const point = hashToCurve(secret)
