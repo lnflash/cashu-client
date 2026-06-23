@@ -44,9 +44,13 @@ export const splitIntoDenominations = (total: number, maxSlots?: number): number
 
   const denominations: number[] = []
   let remaining = total
-  for (let bit = 15; bit >= 0; bit--) {
-    const denom = 1 << bit
-    while (remaining >= denom) {
+  // Decompose into powers of two, high bit first. Use 2**bit (not 1<<bit): JS
+  // bitwise ops are 32-bit, so 1<<bit silently wraps for bit>=31 and the old
+  // 0..15 range dropped every bit above 2^15 — a fund-loss bug for amounts
+  // >= 65536. 52 covers the full safe-integer range.
+  for (let bit = 52; bit >= 0 && remaining > 0; bit--) {
+    const denom = 2 ** bit
+    if (remaining >= denom) {
       denominations.push(denom)
       remaining -= denom
     }
@@ -141,6 +145,12 @@ export const unblindSignature = (
   }
   if (!secp.isPoint(K)) {
     throw new Error("unblindSignature: mintPubkey is not a valid secp256k1 point")
+  }
+  // Validate the blinding factor (checked after the points so callers passing a
+  // bad point still get the point error the tests expect). A zero/out-of-range r
+  // would yield C = C_ (no unblinding) — a silent correctness failure.
+  if (!secp.isPrivate(r)) {
+    throw new Error("unblindSignature: invalid blinding factor r")
   }
 
   const rK = secp.pointMultiply(K, r, true)

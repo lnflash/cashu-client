@@ -22,6 +22,10 @@ jobs:
 
       - run: npm run build
 
+      # dist/ is committed (for `yarn add github:` consumers); fail if it drifts from source.
+      - name: Verify committed dist matches source
+        run: git diff --exit-code dist
+
       - run: npm test
 
       - run: npm audit --omit=dev || true

@@ -8,27 +8,45 @@ const axios_1 = __importDefault(require("axios"));
 const errors_1 = require("./errors");
 // HTTP timeout for all mint requests (5 seconds)
 const HTTP_TIMEOUT = 5000;
-// Validate a mint URL is well-formed and uses HTTPS (or localhost for dev)
+// Validate a mint URL is well-formed and uses HTTPS (or localhost for dev).
+// Parses with the URL API rather than string-prefix matching so that
+// credential-embedded and internal/metadata hosts cannot slip through.
 const sanitizeMintUrl = (mintUrl) => {
-    const trimmed = mintUrl.replace(/\/+$/, ""); // strip trailing slashes
-    if (!trimmed) {
-        throw new Error("Mint URL is empty");
+    let parsed;
+    try {
+        parsed = new URL(mintUrl);
     }
-    // Allow http:// only for localhost dev; require https otherwise
-    if (trimmed.startsWith("http://")) {
-        const host = trimmed.slice(7).split("/")[0].split(":")[0];
-        if (host !== "localhost" && host !== "127.0.0.1") {
+    catch {
+        throw new Error("Mint URL is empty or malformed");
+    }
+    // Reject embedded credentials (https://user:pass@host) — an SSRF/obfuscation vector
+    if (parsed.username || parsed.password) {
+        throw new Error("Mint URL must not contain credentials");
+    }
+    const host = parsed.hostname.toLowerCase();
+    const isLoopback = host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+    if (parsed.protocol === "http:") {
+        if (!isLoopback) {
             throw new Error("Mint URL must use HTTPS");
         }
     }
-    else if (!trimmed.startsWith("https://")) {
+    else if (parsed.protocol !== "https:") {
         throw new Error("Mint URL must start with https:// (or http:// for localhost)");
     }
-    return trimmed;
+    // Block cloud-metadata / link-local endpoints — never a legitimate mint.
+    if (host === "metadata.google.internal" || host.startsWith("169.254.") || host.startsWith("fe80:")) {
+        throw new Error("Mint URL host is not allowed");
+    }
+    // Rebuild without trailing slashes, preserving any base path the mint uses.
+    const path = parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.origin}${path}`;
 };
 const axiosConfig = {
     timeout: HTTP_TIMEOUT,
     maxRedirects: 0,
+    // Cap response size so a hostile mint can't exhaust client memory.
+    maxContentLength: 1000000,
+    maxBodyLength: 1000000,
     headers: { "Content-Type": "application/json" },
     validateStatus: (status) => status >= 200 && status < 300,
 };
@@ -37,6 +55,12 @@ const axiosConfig = {
  */
 const requestMintQuote = async (mintUrl, amount, unit) => {
     try {
+        if (!Number.isInteger(amount) || amount <= 0) {
+            return new errors_1.CashuMintError(`Invalid amount: ${amount} (must be a positive integer)`);
+        }
+        if (!/^[a-z]{3,4}$/.test(unit)) {
+            return new errors_1.CashuMintError(`Invalid unit: ${unit}`);
+        }
         const url = sanitizeMintUrl(mintUrl);
         const { data } = await axios_1.default.post(`${url}/v1/mint/quote/bolt11`, { amount, unit }, axiosConfig);
         return {
@@ -102,7 +126,13 @@ const getMintKeyset = async (mintUrl, keysetId) => {
             return new errors_1.CashuMintError("Invalid keyset ID format");
         }
         const { data } = await axios_1.default.get(`${url}/v1/keys/${keysetId}`, axiosConfig);
-        const ks = data.keysets?.[0] ?? data;
+        const ks = (data.keysets?.[0] ?? data);
+        // Bind the response to the request: a mint returning keys for a different
+        // (or malformed) keyset would otherwise be used as `K` during unblinding,
+        // silently producing unspendable proofs.
+        if (!ks || ks.id !== keysetId || typeof ks.keys !== "object" || ks.keys === null) {
+            return new errors_1.CashuMintError("Mint returned a keyset that does not match the requested ID");
+        }
         return ks;
     }
     catch (err) {
@@ -127,11 +157,27 @@ const mintProofs = async (mintUrl, quoteId, blindedMessages) => {
         if (data.signatures.length !== blindedMessages.length) {
             return new errors_1.CashuMintError(`Mint returned ${data.signatures.length} signatures for ${blindedMessages.length} outputs`);
         }
-        return data.signatures.map((sig) => ({
-            id: sig.id,
-            amount: sig.amount,
-            C_: sig.C_,
-        }));
+        // Bind each returned signature to the output that was requested. The mint
+        // could otherwise reorder or relabel amounts/keysets, producing proofs worth
+        // less than paid or unspendable. (Full NUT-12 DLEQ verification — proving the
+        // mint signed with the advertised key — is tracked as a follow-up.)
+        const rawSigs = data.signatures;
+        const result = [];
+        for (let i = 0; i < rawSigs.length; i++) {
+            const sig = rawSigs[i];
+            const bm = blindedMessages[i];
+            if (sig.id !== bm.id) {
+                return new errors_1.CashuMintError(`Mint signature ${i}: keyset ID mismatch (expected ${bm.id}, got ${sig.id})`);
+            }
+            if (sig.amount !== bm.amount) {
+                return new errors_1.CashuMintError(`Mint signature ${i}: amount mismatch (expected ${bm.amount}, got ${sig.amount})`);
+            }
+            if (typeof sig.C_ !== "string" || !/^0[23][0-9a-fA-F]{64}$/.test(sig.C_)) {
+                return new errors_1.CashuMintError(`Mint signature ${i}: malformed C_`);
+            }
+            result.push({ id: sig.id, amount: sig.amount, C_: sig.C_ });
+        }
+        return result;
     }
     catch (err) {
         const msg = axios_1.default.isAxiosError(err) && err.response?.data?.detail
