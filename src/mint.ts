@@ -8,57 +8,7 @@ import type {
   CashuKeysetDetail,
 } from "./types"
 import { CashuMintError } from "./errors"
-
-// HTTP timeout for all mint requests (5 seconds)
-const HTTP_TIMEOUT = 5000
-
-// Validate a mint URL is well-formed and uses HTTPS (or localhost for dev).
-// Parses with the URL API rather than string-prefix matching so that
-// credential-embedded and internal/metadata hosts cannot slip through.
-const sanitizeMintUrl = (mintUrl: string): string => {
-  let parsed: URL
-  try {
-    parsed = new URL(mintUrl)
-  } catch {
-    throw new Error("Mint URL is empty or malformed")
-  }
-
-  // Reject embedded credentials (https://user:pass@host) — an SSRF/obfuscation vector
-  if (parsed.username || parsed.password) {
-    throw new Error("Mint URL must not contain credentials")
-  }
-
-  const host = parsed.hostname.toLowerCase()
-  const isLoopback =
-    host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]"
-
-  if (parsed.protocol === "http:") {
-    if (!isLoopback) {
-      throw new Error("Mint URL must use HTTPS")
-    }
-  } else if (parsed.protocol !== "https:") {
-    throw new Error("Mint URL must start with https:// (or http:// for localhost)")
-  }
-
-  // Block cloud-metadata / link-local endpoints — never a legitimate mint.
-  if (host === "metadata.google.internal" || host.startsWith("169.254.") || host.startsWith("fe80:")) {
-    throw new Error("Mint URL host is not allowed")
-  }
-
-  // Rebuild without trailing slashes, preserving any base path the mint uses.
-  const path = parsed.pathname.replace(/\/+$/, "")
-  return `${parsed.origin}${path}`
-}
-
-const axiosConfig = {
-  timeout: HTTP_TIMEOUT,
-  maxRedirects: 0,
-  // Cap response size so a hostile mint can't exhaust client memory.
-  maxContentLength: 1_000_000,
-  maxBodyLength: 1_000_000,
-  headers: {"Content-Type": "application/json"},
-  validateStatus: (status: number) => status >= 200 && status < 300,
-} as const
+import { axiosConfig, describeAxiosError, sanitizeMintUrl } from "./http"
 
 /**
  * NUT-04: Request a mint quote.
@@ -220,10 +170,6 @@ export const mintProofs = async (
     }
     return result
   } catch (err) {
-    const msg =
-      axios.isAxiosError(err) && err.response?.data?.detail
-        ? err.response.data.detail
-        : (err as Error).message
-    return new CashuMintError(`Mint proof issuance failed: ${msg}`)
+    return new CashuMintError(`Mint proof issuance failed: ${describeAxiosError(err)}`)
   }
 }
