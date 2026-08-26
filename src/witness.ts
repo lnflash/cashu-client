@@ -26,12 +26,23 @@ export type ParsedP2PKSecret = {
   tags: string[][]
 }
 
+/** The NUT-10 envelope a well-known secret is carried in. */
+export type WellKnownSecret = {
+  kind: string
+  body: Record<string, unknown>
+}
+
 /**
- * Parse a NUT-10 secret string: `["P2PK", {"nonce":..., "data":..., "tags":[...]}]`.
- * Returns null for a plain (non-P2PK) secret, which is not an error — an
- * unlocked proof simply needs no witness.
+ * Parse the NUT-10 envelope only: `[kind, {...}]`.
+ *
+ * Deliberately separate from {@link parseP2PKSecret}. "Is this a well-known
+ * secret at all?" and "is this a P2PK secret this module can verify?" are
+ * different questions, and collapsing them is how an HTLC — or a P2PK secret
+ * whose body is malformed — gets waved through as a plain, unlocked secret that
+ * needs no witness. Returns null only when the secret is not a `[kind, {...}]`
+ * pair, i.e. when it really is a plain string secret.
  */
-export const parseP2PKSecret = (secret: string): ParsedP2PKSecret | null => {
+export const parseWellKnownSecret = (secret: string): WellKnownSecret | null => {
   let parsed: unknown
   try {
     parsed = JSON.parse(secret)
@@ -40,18 +51,51 @@ export const parseP2PKSecret = (secret: string): ParsedP2PKSecret | null => {
   }
   if (!Array.isArray(parsed) || parsed.length < 2) return null
   const [kind, body] = parsed as [unknown, unknown]
-  if (kind !== "P2PK" || typeof body !== "object" || body === null) return null
+  if (typeof kind !== "string" || kind.length === 0) return null
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return null
+  return {kind, body: body as Record<string, unknown>}
+}
 
-  const b = body as Record<string, unknown>
+/**
+ * True when `secret` is a NUT-10 well-known secret of any kind — P2PK, HTLC, or
+ * something this library has never heard of. Anything that is one carries a
+ * spending condition, so it needs a witness the mint will accept.
+ */
+export const isWellKnownSecret = (secret: string): boolean =>
+  parseWellKnownSecret(secret) !== null
+
+/**
+ * Parse a NUT-10 secret string: `["P2PK", {"nonce":..., "data":..., "tags":[...]}]`.
+ *
+ * Returns null for a plain (non-P2PK) secret, for a well-known secret of
+ * another kind, and for a P2PK secret whose body is malformed. Callers deciding
+ * whether a witness is needed must use {@link isWellKnownSecret} instead — a
+ * null here means "this verifier cannot vouch for it", not "it is unlocked".
+ *
+ * Malformed `tags` are rejected outright rather than filtered out. A dropped
+ * tag is indistinguishable from an absent one, so filtering would let anyone
+ * bypass the strict-tag policy in {@link verifyP2PKWitness} by making a tag
+ * malformed (`[["n_sigs", 2]]` — a JSON number, which the mint reads as 2)
+ * instead of unknown.
+ */
+export const parseP2PKSecret = (secret: string): ParsedP2PKSecret | null => {
+  const envelope = parseWellKnownSecret(secret)
+  if (!envelope || envelope.kind !== "P2PK") return null
+
+  const b = envelope.body
   if (typeof b.nonce !== "string" || typeof b.data !== "string") return null
 
-  const tags = Array.isArray(b.tags)
-    ? (b.tags.filter(
-        t => Array.isArray(t) && t.every(x => typeof x === "string"),
-      ) as string[][])
-    : []
+  if (b.tags !== undefined) {
+    if (
+      !Array.isArray(b.tags) ||
+      !b.tags.every(t => Array.isArray(t) && t.every(x => typeof x === "string"))
+    ) {
+      return null
+    }
+  }
+  const tags = (b.tags ?? []) as string[][]
 
-  return {kind, nonce: b.nonce, data: b.data, tags}
+  return {kind: envelope.kind, nonce: b.nonce, data: b.data, tags}
 }
 
 /**
@@ -184,9 +228,16 @@ export const verifyP2PKWitness = (proof: CashuProof): boolean => {
 /**
  * True when this proof needs a witness before the mint will accept it.
  * A plain-secret proof does not.
+ *
+ * Keyed on "is this a well-known secret" rather than "did the P2PK parser
+ * succeed". Those differ for an HTLC secret and for a malformed P2PK one, and
+ * reading either as "plain, needs no witness" submits a proof the mint will
+ * refuse — after the card has already burned the slot. Anything carrying a
+ * NUT-10 spending condition this module cannot verify is reported by
+ * {@link findUnsignedProofs} instead of waved through.
  */
 export const requiresWitness = (proof: CashuProof): boolean =>
-  parseP2PKSecret(proof.secret) !== null
+  isWellKnownSecret(proof.secret)
 
 /**
  * Check every proof in a set carries a valid witness, returning the indices

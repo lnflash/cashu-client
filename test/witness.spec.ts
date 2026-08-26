@@ -5,6 +5,7 @@ import {
   attachP2PKWitness,
   buildP2PKSecret,
   findUnsignedProofs,
+  isWellKnownSecret,
   meltAmountRequired,
   p2pkMessageToSign,
   parseP2PKSecret,
@@ -59,6 +60,43 @@ describe("NUT-10 secret parsing", () => {
     const proof: CashuProof = {id: "a", amount: 1, secret: "plain", C: "02" + "11".repeat(32)}
     expect(requiresWitness(proof)).toBe(false)
     expect(findUnsignedProofs([proof])).toEqual([])
+    expect(isWellKnownSecret("plain")).toBe(false)
+    expect(isWellKnownSecret('["P2PK"]')).toBe(false)
+    expect(isWellKnownSecret('["P2PK","not-an-object"]')).toBe(false)
+  })
+
+  /**
+   * `parseP2PKSecret` returns null for three different things — a plain secret,
+   * a well-known secret of another kind, and a malformed P2PK secret — and only
+   * the first means "unlocked". Keying `requiresWitness` off the null meant the
+   * other two were submitted unwitnessed, refused by the mint, and the card had
+   * already burned its slots.
+   */
+  it("flags a well-known secret of another kind as needing a witness", () => {
+    const secret = JSON.stringify([
+      "HTLC",
+      {nonce: "aa".repeat(32), data: "ff".repeat(32), tags: [["pubkeys", "02" + "11".repeat(32)]]},
+    ])
+    const proof: CashuProof = {id: "a", amount: 1, secret, C: "02" + "11".repeat(32)}
+
+    // Not a P2PK secret, so this verifier cannot vouch for it …
+    expect(parseP2PKSecret(secret)).toBeNull()
+    // … which is exactly why it must not be waved through as unlocked.
+    expect(isWellKnownSecret(secret)).toBe(true)
+    expect(requiresWitness(proof)).toBe(true)
+    expect(verifyP2PKWitness(proof)).toBe(false)
+    expect(findUnsignedProofs([proof])).toEqual([0])
+  })
+
+  it("flags a malformed P2PK secret as needing a witness rather than as plain", () => {
+    // `data` is a JSON number, so the P2PK parser bails — but the secret is
+    // still a NUT-10 spending condition and the mint will still demand one.
+    const secret = JSON.stringify(["P2PK", {nonce: "aa".repeat(32), data: 42}])
+    const proof: CashuProof = {id: "a", amount: 1, secret, C: "02" + "11".repeat(32)}
+
+    expect(parseP2PKSecret(secret)).toBeNull()
+    expect(requiresWitness(proof)).toBe(true)
+    expect(findUnsignedProofs([proof])).toEqual([0])
   })
 })
 
@@ -227,6 +265,51 @@ describe("NUT-11 spending-condition tags", () => {
     const card = makeCardKey()
     expect(verifyP2PKWitness(proofWithTags(card, [["n_sigs", "many"]]))).toBe(false)
     expect(verifyP2PKWitness(proofWithTags(card, [["n_sigs", "0"]]))).toBe(false)
+  })
+
+  /**
+   * Filtering malformed tag entries out before the strict-tag check made a
+   * dropped tag indistinguishable from an absent one — so the whole policy was
+   * bypassable by making a tag *malformed* rather than unknown. Nutshell reads
+   * `["n_sigs", 2]` (a JSON number) as 2 and enforces it; a client that dropped
+   * the tag would submit one signature and be refused at the mint.
+   */
+  const rawTaggedProof = (card: ReturnType<typeof makeCardKey>, tags: unknown) => {
+    const base: CashuProof = {
+      id: "0059534ce0bfa19a",
+      amount: 8,
+      secret: JSON.stringify([
+        "P2PK",
+        {nonce: crypto.randomBytes(32).toString("hex"), data: card.pubHex, tags},
+      ]),
+      C: "02" + crypto.randomBytes(32).toString("hex"),
+    }
+    return attachP2PKWitness(base, [cardSign(card.d, base)])
+  }
+
+  it("rejects a malformed tag instead of dropping it", () => {
+    const card = makeCardKey()
+    for (const tags of [
+      [["n_sigs", 2]], // number, not string — the mint still enforces it
+      [["sigflag", ["SIG_ALL"]]], // nested array
+      [["n_sigs", null]],
+      ["n_sigs"], // tag is not an array at all
+      "tags-should-be-an-array",
+      {},
+      null,
+    ]) {
+      const proof = rawTaggedProof(card, tags)
+      expect(parseP2PKSecret(proof.secret)).toBeNull()
+      expect(verifyP2PKWitness(proof)).toBe(false)
+      // Still a NUT-10 secret, so it must be reported rather than submitted.
+      expect(requiresWitness(proof)).toBe(true)
+      expect(findUnsignedProofs([proof])).toEqual([0])
+    }
+  })
+
+  it("still accepts an absent tags field", () => {
+    const card = makeCardKey()
+    expect(verifyP2PKWitness(rawTaggedProof(card, undefined))).toBe(true)
   })
 
   it("rejects tags this verifier does not implement rather than ignoring them", () => {

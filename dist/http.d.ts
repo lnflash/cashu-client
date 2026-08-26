@@ -44,6 +44,13 @@ export declare const axiosConfig: {
 export declare const describeAxiosError: (err: unknown) => string;
 /** A quote/keyset identifier safe to interpolate into a URL path. */
 export declare const isSafePathId: (id: string) => boolean;
+/**
+ * A NUT-02 keyset identifier safe to interpolate into a URL path.
+ *
+ * Narrower than {@link isSafePathId} — keyset ids are hex — and bounded, so a
+ * caller cannot hand the mint a megabyte-long path segment.
+ */
+export declare const isSafeKeysetId: (id: string) => boolean;
 /** A compressed secp256k1 point in hex. */
 export declare const isCompressedPointHex: (v: unknown) => v is string;
 /** A 32-byte scalar in hex. */

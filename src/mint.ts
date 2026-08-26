@@ -12,6 +12,8 @@ import {
   axiosConfig,
   describeAxiosError,
   isCompressedPointHex,
+  isSafeKeysetId,
+  isSafePathId,
   parseResponseDLEQ,
   sanitizeMintUrl,
 } from "./http"
@@ -57,8 +59,9 @@ export const getMintQuoteState = async (
 ): Promise<CashuMintQuote | CashuMintError> => {
   try {
     const url = sanitizeMintUrl(mintUrl)
-    // Sanitize quoteId — only allow alphanumeric + hyphens
-    if (!/^[a-zA-Z0-9_-]+$/.test(quoteId)) {
+    // Shared with the melt path deliberately: an inline copy of this regex is
+    // how the two drifted apart (this one had no length bound).
+    if (!isSafePathId(quoteId)) {
       return new CashuMintError("Invalid quote ID format")
     }
     const {data} = await axios.get(
@@ -130,8 +133,7 @@ export const getMintKeyset = async (
 ): Promise<CashuKeysetDetail | CashuMintError> => {
   try {
     const url = sanitizeMintUrl(mintUrl)
-    // Sanitize keysetId — only allow hex characters
-    if (!/^[0-9a-fA-F]+$/.test(keysetId)) {
+    if (!isSafeKeysetId(keysetId)) {
       return new CashuMintError("Invalid keyset ID format")
     }
     const {data} = await axios.get(`${url}/v1/keys/${keysetId}`, axiosConfig)

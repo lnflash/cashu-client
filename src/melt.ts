@@ -106,7 +106,15 @@ const parseChange = (
 ): {change: CashuBlindSignature[]; changeErrors: string[]} => {
   const change: CashuBlindSignature[] = []
   const changeErrors: string[] = []
-  if (!Array.isArray(raw)) return {change, changeErrors}
+  // Absent is legitimate — a melt with no overpay, or one submitted without
+  // change outputs. Present-but-not-an-array is not, and returning silently
+  // empty for it would make a mint that mangled the whole field
+  // indistinguishable from one that owed no change at all.
+  if (raw === undefined || raw === null) return {change, changeErrors}
+  if (!Array.isArray(raw)) {
+    changeErrors.push("Melt change: response field is not an array")
+    return {change, changeErrors}
+  }
 
   for (const [i, entry] of (raw as Array<Record<string, unknown>>).entries()) {
     if (!entry || typeof entry !== "object") {
@@ -117,7 +125,15 @@ const parseChange = (
       changeErrors.push(`Melt change signature ${i}: malformed C_`)
       continue
     }
-    if (typeof entry.id !== "string" || !Number.isInteger(entry.amount)) {
+    // Change amounts are the one value here that is not bound to anything the
+    // client sent, so the lower bound has to come from us: a negative amount
+    // would flow straight into the caller's proof set and quietly subtract from
+    // `sumProofs`.
+    if (
+      typeof entry.id !== "string" ||
+      !Number.isInteger(entry.amount) ||
+      (entry.amount as number) < 0
+    ) {
       changeErrors.push(`Melt change signature ${i}: malformed id/amount`)
       continue
     }
@@ -265,10 +281,10 @@ export const meltProofs = async (
       return new CashuMeltResponseError(quote.message, change, changeErrors)
     }
 
-    if (Array.isArray(data.change)) {
-      quote.change = change
-      if (changeErrors.length > 0) quote.changeErrors = changeErrors
-    }
+    if (Array.isArray(data.change)) quote.change = change
+    // Reported independently of the shape of `data.change`: the errors are the
+    // only signal that a change field arrived and could not be used.
+    if (changeErrors.length > 0) quote.changeErrors = changeErrors
 
     return quote
   } catch (err) {
@@ -277,26 +293,87 @@ export const meltProofs = async (
 }
 
 /**
- * NUT-02 input fee for a request with `nInputs` proofs, in the keyset's base
- * unit. The mint charges `input_fee_ppk` parts per thousand *per input*, and it
- * comes out of the inputs — so it is part of what the selection must cover.
+ * NUT-02 `input_fee_ppk` keyed by keyset id.
+ *
+ * A wallet that has lived through a keyset rotation holds proofs from more than
+ * one keyset, and NUT-02 declares the rate *per keyset* — so the fee is the sum
+ * of each input's own rate, rounded once. Build one of these from
+ * {@link getMintKeysets}.
  */
-export const inputFee = (nInputs: number, inputFeePpk = 0): number =>
-  inputFeePpk > 0 ? Math.ceil((nInputs * inputFeePpk) / 1000) : 0
+export type InputFeeRates = Record<string, number>
+
+/**
+ * NUT-02 input fee for a request, in the keyset's base unit. The mint charges
+ * `input_fee_ppk` parts per thousand *per input*, and it comes out of the
+ * inputs — so it is part of what the selection must cover.
+ *
+ * Two forms. Pass the proofs plus an {@link InputFeeRates} map when the inputs
+ * may span keysets: the fee is `ceil(sum of each input's own ppk / 1000)`, which
+ * is what the mint computes. Pass a count (or the proofs) plus a single rate
+ * only for the uniform case — applying one keyset's rate to another's proofs
+ * over-charges (the balance check then demands outputs that are short) or
+ * under-charges (the mint rejects), and either way the card has already burned
+ * its slots. A mixed-keyset proof set with a scalar rate is therefore refused
+ * rather than silently mispriced.
+ */
+export function inputFee(nInputs: number, inputFeePpk?: number): number
+export function inputFee(
+  inputs: Pick<CashuProof, "id">[],
+  rates: number | InputFeeRates,
+): number
+export function inputFee(
+  inputs: number | Pick<CashuProof, "id">[],
+  rates: number | InputFeeRates = 0,
+): number {
+  if (typeof inputs === "number") {
+    if (typeof rates !== "number") {
+      throw new Error(
+        "inputFee: a per-keyset input_fee_ppk map needs the input proofs, not a count",
+      )
+    }
+    return rates > 0 ? Math.ceil((inputs * rates) / 1000) : 0
+  }
+
+  if (typeof rates === "number") {
+    const ids = new Set(inputs.map(p => p.id))
+    if (ids.size > 1) {
+      throw new Error(
+        `inputFee: inputs span ${ids.size} keysets ([${[...ids].join(", ")}]) — ` +
+          "supply a per-keyset input_fee_ppk map, not a single rate",
+      )
+    }
+    return rates > 0 ? Math.ceil((inputs.length * rates) / 1000) : 0
+  }
+
+  // One ceil over the summed ppk, not a ceil per input: rounding each input up
+  // separately over-charges a mint that only ever rounds the total.
+  const totalPpk = inputs.reduce((sum, p) => sum + (rates[p.id] ?? 0), 0)
+  return totalPpk > 0 ? Math.ceil(totalPpk / 1000) : 0
+}
+
+/** Dispatch to the right {@link inputFee} form from a union-typed caller. */
+const feeFor = (
+  inputs: number | Pick<CashuProof, "id">[],
+  rates: number | InputFeeRates,
+): number =>
+  typeof inputs === "number"
+    ? inputFee(inputs, rates as number)
+    : inputFee(inputs, rates)
 
 /**
  * Total input value required to satisfy a quote.
  *
  * Inputs must cover the invoice amount, the mint's fee reserve, and the NUT-02
- * per-input fee. The fee depends on how many proofs are submitted, so pass the
- * count (and the keyset's `input_fee_ppk`) when the mint charges one; against a
- * zero-fee mint the defaults reproduce the old behaviour.
+ * per-input fee. The fee depends on which proofs are submitted, so pass them
+ * (with the keyset rates) when the mint charges one; against a zero-fee mint
+ * the defaults reproduce the old behaviour. A bare count is still accepted for
+ * the single-keyset case.
  */
 export const meltAmountRequired = (
   quote: CashuMeltQuote,
-  nInputs = 0,
-  inputFeePpk = 0,
-): number => quote.amount + quote.feeReserve + inputFee(nInputs, inputFeePpk)
+  inputs: number | Pick<CashuProof, "id">[] = 0,
+  rates: number | InputFeeRates = 0,
+): number => quote.amount + quote.feeReserve + feeFor(inputs, rates)
 
 /** Sum of proof denominations. */
 export const sumProofs = (proofs: CashuProof[]): number =>
@@ -317,22 +394,25 @@ const sortDescending = (proofs: CashuProof[]): CashuProof[] =>
 const accumulate = (
   ordered: CashuProof[],
   base: number,
-  inputFeePpk: number,
+  rates: number | InputFeeRates,
 ): {proofs: CashuProof[]; total: number} | null => {
   const chosen: CashuProof[] = []
   let total = 0
   for (const proof of ordered) {
     chosen.push(proof)
     total += proof.amount
-    if (total >= base + inputFee(chosen.length, inputFeePpk)) break
+    if (total >= base + inputFee(chosen, rates)) break
   }
-  if (total < base + inputFee(chosen.length, inputFeePpk)) return null
+  if (total < base + inputFee(chosen, rates)) return null
 
   for (const proof of [...chosen].sort((a, b) => b.amount - a.amount)) {
     const idx = chosen.indexOf(proof)
     if (idx === -1) continue
     const without = total - proof.amount
-    if (without >= base + inputFee(chosen.length - 1, inputFeePpk)) {
+    // The fee of the set *without this proof*, not of "one fewer input" — with
+    // per-keyset rates those are different numbers.
+    const remaining = chosen.filter((_, k) => k !== idx)
+    if (without >= base + inputFee(remaining, rates)) {
       chosen.splice(idx, 1)
       total = without
     }
@@ -354,24 +434,26 @@ const accumulate = (
  * returning a short selection that the mint would reject after the card had
  * already burned the slots.
  *
- * @param inputFeePpk the keyset's NUT-02 `input_fee_ppk`, if it charges one
+ * @param rates the keyset's NUT-02 `input_fee_ppk` if a single keyset is in
+ *              play, or an {@link InputFeeRates} map keyed by keyset id when
+ *              the proofs span keysets (a rotation leaves a card holding both)
  */
 export const selectProofsForMelt = (
   proofs: CashuProof[],
   quote: CashuMeltQuote,
-  inputFeePpk = 0,
+  rates: number | InputFeeRates = 0,
 ): CashuProof[] | null => {
   const base = quote.amount + quote.feeReserve
 
   const ascending = accumulate(
     [...proofs].sort((a, b) => a.amount - b.amount),
     base,
-    inputFeePpk,
+    rates,
   )
   const descending = accumulate(
     [...proofs].sort((a, b) => b.amount - a.amount),
     base,
-    inputFeePpk,
+    rates,
   )
 
   if (!ascending) return descending ? sortDescending(descending.proofs) : null

@@ -160,6 +160,15 @@ export const describeAxiosError = (err: unknown): string => {
 export const isSafePathId = (id: string): boolean =>
   typeof id === "string" && id.length > 0 && id.length <= 256 && /^[a-zA-Z0-9_-]+$/.test(id)
 
+/**
+ * A NUT-02 keyset identifier safe to interpolate into a URL path.
+ *
+ * Narrower than {@link isSafePathId} — keyset ids are hex — and bounded, so a
+ * caller cannot hand the mint a megabyte-long path segment.
+ */
+export const isSafeKeysetId = (id: string): boolean =>
+  typeof id === "string" && /^[0-9a-fA-F]{1,128}$/.test(id)
+
 /** A compressed secp256k1 point in hex. */
 export const isCompressedPointHex = (v: unknown): v is string =>
   typeof v === "string" && /^0[23][0-9a-fA-F]{64}$/.test(v)

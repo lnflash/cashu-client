@@ -218,6 +218,46 @@ describe("meltProofs", () => {
     expect(result.changeErrors).toHaveLength(1)
   })
 
+  it("rejects a negative change amount rather than banking it", async () => {
+    // Change amounts are the one value in a melt response that is not bound to
+    // anything the client sent, so nothing else would catch this: a negative
+    // amount flows into the caller's proof set and subtracts from sumProofs.
+    mockAxios.mockResolvedValueOnce({
+      data: {
+        state: "PAID",
+        change: [
+          {id: "ks", amount: -4, C_},
+          {id: "ks", amount: 2, C_},
+        ],
+      },
+    })
+    const result = (await meltProofs(MINT, "q1", [plainProof(8)])) as CashuMeltQuote
+
+    expect(result.change!.map(c => c.amount)).toEqual([2])
+    expect(result.changeErrors).toHaveLength(1)
+    expect(result.changeErrors!.join()).toMatch(/malformed id\/amount/)
+  })
+
+  it("reports a change field that is not an array instead of silently dropping it", async () => {
+    // `{"0": {...}}` is not an array, so no entry is ever inspected. Returning
+    // silently empty makes this indistinguishable from a melt with no overpay.
+    mockAxios.mockResolvedValueOnce({
+      data: {state: "PAID", change: {"0": {id: "ks", amount: 2, C_}}},
+    })
+    const result = (await meltProofs(MINT, "q1", [plainProof(8)])) as CashuMeltQuote
+
+    expect(result).not.toBeInstanceOf(Error)
+    expect(result.change).toBeUndefined()
+    expect(result.changeErrors!.join()).toMatch(/not an array/)
+  })
+
+  it("stays quiet when the mint owes no change at all", async () => {
+    mockAxios.mockResolvedValueOnce({data: {state: "PAID"}})
+    const result = (await meltProofs(MINT, "q1", [plainProof(8)])) as CashuMeltQuote
+    expect(result.change).toBeUndefined()
+    expect(result.changeErrors).toBeUndefined()
+  })
+
   it("still returns the change when the quote portion is unparseable", async () => {
     mockAxios.mockResolvedValueOnce({
       data: {state: "NONSENSE", change: [{id: "ks", amount: 2, C_}]},
@@ -265,6 +305,81 @@ describe("input fees", () => {
   it("returns null when the fee pushes the requirement out of reach", () => {
     const proofs = [1, 1, 1, 1].map(plainProof)
     expect(selectProofsForMelt(proofs, quote(4, 0), 1000)).toBeNull()
+  })
+})
+
+/**
+ * NUT-02 declares `input_fee_ppk` per keyset, so after a rotation a card holds
+ * proofs at two different rates and the fee is `ceil(sum of each input's own
+ * ppk / 1000)`. One scalar applied to the whole set over-charges the old
+ * zero-fee proofs (the swap balance check then demands outputs that are short)
+ * or under-charges (the mint rejects) — either way after the slots are burned.
+ */
+describe("input fees across keysets", () => {
+  const OLD = "00aaaaaaaaaaaaaa"
+  const NEW = "00bbbbbbbbbbbbbb"
+  const rates = {[OLD]: 0, [NEW]: 100}
+
+  const onKeyset = (id: string) => (amount: number): CashuProof => ({
+    ...plainProof(amount),
+    id,
+  })
+
+  it("sums each input's own rate rather than applying one to all", () => {
+    const mixed = [...[1, 1, 1, 1].map(onKeyset(OLD)), ...[1, 1].map(onKeyset(NEW))]
+    // Only the two NEW proofs are charged: ceil(200 / 1000) = 1.
+    expect(inputFee(mixed, rates)).toBe(1)
+    // A flat 100 over all six would have been ceil(600/1000) = 1 here, but a
+    // flat 0 would have been 0 — the under-charge the mint rejects.
+    expect(inputFee(mixed, {[OLD]: 0, [NEW]: 0})).toBe(0)
+    expect(inputFee([...[1, 1].map(onKeyset(OLD))], rates)).toBe(0)
+  })
+
+  it("rounds the summed ppk once, not per input", () => {
+    // 11 inputs at 100 ppk: one ceil over 1100 is 2, a ceil per input is 11.
+    const eleven = Array.from({length: 11}, () => onKeyset(NEW)(1))
+    expect(inputFee(eleven, rates)).toBe(2)
+    expect(inputFee(eleven, 100)).toBe(2)
+  })
+
+  it("treats an unknown keyset as zero-fee rather than guessing", () => {
+    expect(inputFee([onKeyset("00cccccccccccccc")(1)], rates)).toBe(0)
+  })
+
+  it("refuses a mixed-keyset set when only a scalar rate is supplied", () => {
+    const mixed = [onKeyset(OLD)(1), onKeyset(NEW)(1)]
+    expect(() => inputFee(mixed, 100)).toThrow(/span 2 keysets/)
+    // Uniform sets keep working with a scalar.
+    expect(() => inputFee([onKeyset(NEW)(1), onKeyset(NEW)(1)], 100)).not.toThrow()
+  })
+
+  it("refuses a per-keyset map when given only a count", () => {
+    expect(() => (inputFee as (a: unknown, b: unknown) => number)(3, rates)).toThrow(
+      /needs the input proofs/,
+    )
+  })
+
+  it("selects against the real per-keyset fee", () => {
+    // Four zero-fee OLD 1-sat proofs and one NEW 4-sat proof at 1 sat/input.
+    const perInput = {[OLD]: 0, [NEW]: 1000}
+    const proofs = [...[1, 1, 1, 1].map(onKeyset(OLD)), onKeyset(NEW)(4)]
+    const chosen = selectProofsForMelt(proofs, quote(4, 0), perInput)!
+
+    expect(chosen).not.toBeNull()
+    // The four OLD proofs cover the invoice and owe no fee; the NEW 4 would owe
+    // a sat on top and need a fifth proof.
+    expect(sumProofs(chosen)).toBe(4)
+    expect(chosen.every(p => p.id === OLD)).toBe(true)
+    expect(inputFee(chosen, perInput)).toBe(0)
+    // The same set with a single rate is refused rather than mispriced.
+    expect(() => selectProofsForMelt(proofs, quote(4, 0), 1000)).toThrow(/span 2 keysets/)
+  })
+
+  it("adds the per-keyset fee to the melt requirement", () => {
+    const mixed = [...[1, 1].map(onKeyset(OLD)), ...[1, 1].map(onKeyset(NEW))]
+    expect(meltAmountRequired(quote(100, 7), mixed, {[OLD]: 0, [NEW]: 1000})).toBe(109)
+    // The count form still works for the single-keyset case.
+    expect(meltAmountRequired(quote(100, 7), 3, 1000)).toBe(110)
   })
 })
 

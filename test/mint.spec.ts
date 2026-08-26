@@ -11,7 +11,13 @@ jest.mock("axios", () => ({
   isAxiosError: jest.fn((err: unknown) => err && typeof err === "object" && "isAxiosError" in err),
 }))
 
-import {requestMintQuote, getMintKeysets, getMintKeyset, CashuMintError} from "../src"
+import {
+  requestMintQuote,
+  getMintQuoteState,
+  getMintKeysets,
+  getMintKeyset,
+  CashuMintError,
+} from "../src"
 import type {CashuKeyset} from "../src"
 
 describe("Mint client URL sanitization", () => {
@@ -96,5 +102,34 @@ describe("keyset parsing", () => {
     const result = await getMintKeyset("https://mint.example.com", "00abcdef")
     expect(result).toBeInstanceOf(CashuMintError)
     expect((result as Error).message).toContain("keyset not found")
+  })
+})
+
+/**
+ * These two path interpolations used inline regexes with no length bound while
+ * the melt ones went through the shared `isSafePathId` — exactly the drift the
+ * shared helper exists to prevent.
+ */
+describe("mint path id validation", () => {
+  beforeEach(() => {
+    mockAxios.mockReset()
+  })
+
+  it("bounds the quote id like the melt path does", async () => {
+    for (const bad of ["../../admin", "", "a".repeat(257)]) {
+      const result = await getMintQuoteState("https://mint.example.com", bad)
+      expect(result).toBeInstanceOf(CashuMintError)
+      expect((result as Error).message).toMatch(/Invalid quote ID/)
+    }
+    expect(mockAxios).not.toHaveBeenCalled()
+  })
+
+  it("bounds the keyset id and keeps it hex", async () => {
+    for (const bad of ["../../admin", "", "zz", "0".repeat(129)]) {
+      const result = await getMintKeyset("https://mint.example.com", bad)
+      expect(result).toBeInstanceOf(CashuMintError)
+      expect((result as Error).message).toMatch(/Invalid keyset ID/)
+    }
+    expect(mockAxios).not.toHaveBeenCalled()
   })
 })

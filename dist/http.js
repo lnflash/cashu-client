@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.parseResponseDLEQ = exports.isScalarHex = exports.isCompressedPointHex = exports.isSafePathId = exports.describeAxiosError = exports.axiosConfig = exports.sanitizeMintUrl = exports.normalizeHostname = exports.HTTP_TIMEOUT = void 0;
+exports.parseResponseDLEQ = exports.isScalarHex = exports.isCompressedPointHex = exports.isSafeKeysetId = exports.isSafePathId = exports.describeAxiosError = exports.axiosConfig = exports.sanitizeMintUrl = exports.normalizeHostname = exports.HTTP_TIMEOUT = void 0;
 const axios_1 = __importDefault(require("axios"));
 /**
  * Shared HTTP surface for every mint call.
@@ -163,6 +163,14 @@ exports.describeAxiosError = describeAxiosError;
 /** A quote/keyset identifier safe to interpolate into a URL path. */
 const isSafePathId = (id) => typeof id === "string" && id.length > 0 && id.length <= 256 && /^[a-zA-Z0-9_-]+$/.test(id);
 exports.isSafePathId = isSafePathId;
+/**
+ * A NUT-02 keyset identifier safe to interpolate into a URL path.
+ *
+ * Narrower than {@link isSafePathId} — keyset ids are hex — and bounded, so a
+ * caller cannot hand the mint a megabyte-long path segment.
+ */
+const isSafeKeysetId = (id) => typeof id === "string" && /^[0-9a-fA-F]{1,128}$/.test(id);
+exports.isSafeKeysetId = isSafeKeysetId;
 /** A compressed secp256k1 point in hex. */
 const isCompressedPointHex = (v) => typeof v === "string" && /^0[23][0-9a-fA-F]{64}$/.test(v);
 exports.isCompressedPointHex = isCompressedPointHex;

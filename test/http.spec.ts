@@ -5,6 +5,7 @@
 
 import {
   isCompressedPointHex,
+  isSafeKeysetId,
   isSafePathId,
   isScalarHex,
   normalizeHostname,
@@ -132,6 +133,15 @@ describe("response field validators", () => {
     expect(isSafePathId("../../admin")).toBe(false)
     expect(isSafePathId("")).toBe(false)
     expect(isSafePathId("a".repeat(257))).toBe(false)
+  })
+
+  it("bounds keyset ids to hex of a plausible length", () => {
+    expect(isSafeKeysetId("0059534ce0bfa19a")).toBe(true)
+    expect(isSafeKeysetId("00ABCDEF")).toBe(true)
+    expect(isSafeKeysetId("../../admin")).toBe(false)
+    expect(isSafeKeysetId("zz")).toBe(false)
+    expect(isSafeKeysetId("")).toBe(false)
+    expect(isSafeKeysetId("0".repeat(129))).toBe(false)
   })
 })
 

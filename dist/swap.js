@@ -41,7 +41,12 @@ const swapProofs = async (mintUrl, inputs, outputs, inputFeePpk = 0) => {
         // is already marked spent by the time we are assembling a swap.
         const inputTotal = (0, melt_1.sumProofs)(inputs);
         const outputTotal = outputs.reduce((total, o) => total + o.amount, 0);
-        const fee = (0, melt_1.inputFee)(inputs.length, inputFeePpk);
+        // Computed from the proofs, not from a count: after a keyset rotation the
+        // inputs span two keysets with different NUT-02 rates, and one scalar
+        // applied to all of them is wrong in both directions. `inputFee` refuses a
+        // mixed set with a scalar rate; that throw lands in the catch below as a
+        // CashuMintError, before any proof is submitted.
+        const fee = (0, melt_1.inputFee)(inputs, inputFeePpk);
         const expected = inputTotal - fee;
         if (outputTotal !== expected) {
             const feeNote = fee > 0 ? ` minus the ${fee} input fee` : "";

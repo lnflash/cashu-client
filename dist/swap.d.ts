@@ -1,5 +1,6 @@
 import type { CashuBlindSignature, CashuBlindedMessage, CashuProof } from "./types";
 import { CashuMintError } from "./errors";
+import type { InputFeeRates } from "./melt";
 /**
  * NUT-03: swapping — exchange proofs for new ones of the same total value.
  *
@@ -14,4 +15,4 @@ import { CashuMintError } from "./errors";
  * Inputs are consumed on success. Like melt this is not idempotent: if the
  * response is lost, check the inputs with NUT-07 rather than resubmitting.
  */
-export declare const swapProofs: (mintUrl: string, inputs: CashuProof[], outputs: CashuBlindedMessage[], inputFeePpk?: number) => Promise<CashuBlindSignature[] | CashuMintError>;
+export declare const swapProofs: (mintUrl: string, inputs: CashuProof[], outputs: CashuBlindedMessage[], inputFeePpk?: number | InputFeeRates) => Promise<CashuBlindSignature[] | CashuMintError>;

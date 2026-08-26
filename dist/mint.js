@@ -38,8 +38,9 @@ exports.requestMintQuote = requestMintQuote;
 const getMintQuoteState = async (mintUrl, quoteId) => {
     try {
         const url = (0, http_1.sanitizeMintUrl)(mintUrl);
-        // Sanitize quoteId — only allow alphanumeric + hyphens
-        if (!/^[a-zA-Z0-9_-]+$/.test(quoteId)) {
+        // Shared with the melt path deliberately: an inline copy of this regex is
+        // how the two drifted apart (this one had no length bound).
+        if (!(0, http_1.isSafePathId)(quoteId)) {
             return new errors_1.CashuMintError("Invalid quote ID format");
         }
         const { data } = await axios_1.default.get(`${url}/v1/mint/quote/bolt11/${quoteId}`, http_1.axiosConfig);
@@ -101,8 +102,7 @@ exports.getMintKeysets = getMintKeysets;
 const getMintKeyset = async (mintUrl, keysetId) => {
     try {
         const url = (0, http_1.sanitizeMintUrl)(mintUrl);
-        // Sanitize keysetId — only allow hex characters
-        if (!/^[0-9a-fA-F]+$/.test(keysetId)) {
+        if (!(0, http_1.isSafeKeysetId)(keysetId)) {
             return new errors_1.CashuMintError("Invalid keyset ID format");
         }
         const { data } = await axios_1.default.get(`${url}/v1/keys/${keysetId}`, http_1.axiosConfig);

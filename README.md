@@ -42,14 +42,21 @@ or `checkProofStates`, never a retry.
 invalid**, because by the time a terminal is assembling a melt the card has
 already marked its slots spent; failing locally leaves the proof intact, whereas
 failing at the mint does not. The local check honours the secret's `sigflag` and
-`n_sigs` tags, and refuses outright on a tag it does not implement — a check
-looser than the mint's would pass locally and still burn the slots.
+`n_sigs` tags, and refuses outright on a tag it does not implement — or on a tag
+it cannot parse, since a dropped tag is indistinguishable from an absent one. A
+check looser than the mint's would pass locally and still burn the slots. Same
+reasoning for a NUT-10 secret of a kind this library cannot verify (an HTLC, or
+a P2PK secret with a malformed body): it is reported by `findUnsignedProofs`
+rather than treated as an unlocked, witness-free proof.
 
 **Overpay is silent.** `changeOutputs` on `meltProofs` is optional and anything
 overpaid without them is kept by the mint, so `selectProofsForMelt` minimises
 the overpay rather than taking the largest proof that fits. If the mint charges
 a NUT-02 `input_fee_ppk`, pass it to `selectProofsForMelt` and `swapProofs` —
-otherwise every request is short by exactly the fee and gets rejected.
+otherwise every request is short by exactly the fee and gets rejected. The rate
+is declared *per keyset*, so once a rotation leaves a card holding proofs from
+two of them, pass a `{[keysetId]: input_fee_ppk}` map instead of one number; a
+single rate applied to a mixed set is refused rather than mispriced.
 
 **The error-returning calls return errors, not falsy values.** These functions
 return `T | CashuMintError` rather than throwing, so check before use.

@@ -36,20 +36,40 @@ export declare const getMeltQuoteState: (mintUrl: string, quoteId: string) => Pr
  */
 export declare const meltProofs: (mintUrl: string, quoteId: string, proofs: CashuProof[], changeOutputs?: CashuBlindedMessage[]) => Promise<CashuMeltQuote | CashuMintError>;
 /**
- * NUT-02 input fee for a request with `nInputs` proofs, in the keyset's base
- * unit. The mint charges `input_fee_ppk` parts per thousand *per input*, and it
- * comes out of the inputs — so it is part of what the selection must cover.
+ * NUT-02 `input_fee_ppk` keyed by keyset id.
+ *
+ * A wallet that has lived through a keyset rotation holds proofs from more than
+ * one keyset, and NUT-02 declares the rate *per keyset* — so the fee is the sum
+ * of each input's own rate, rounded once. Build one of these from
+ * {@link getMintKeysets}.
  */
-export declare const inputFee: (nInputs: number, inputFeePpk?: number) => number;
+export type InputFeeRates = Record<string, number>;
+/**
+ * NUT-02 input fee for a request, in the keyset's base unit. The mint charges
+ * `input_fee_ppk` parts per thousand *per input*, and it comes out of the
+ * inputs — so it is part of what the selection must cover.
+ *
+ * Two forms. Pass the proofs plus an {@link InputFeeRates} map when the inputs
+ * may span keysets: the fee is `ceil(sum of each input's own ppk / 1000)`, which
+ * is what the mint computes. Pass a count (or the proofs) plus a single rate
+ * only for the uniform case — applying one keyset's rate to another's proofs
+ * over-charges (the balance check then demands outputs that are short) or
+ * under-charges (the mint rejects), and either way the card has already burned
+ * its slots. A mixed-keyset proof set with a scalar rate is therefore refused
+ * rather than silently mispriced.
+ */
+export declare function inputFee(nInputs: number, inputFeePpk?: number): number;
+export declare function inputFee(inputs: Pick<CashuProof, "id">[], rates: number | InputFeeRates): number;
 /**
  * Total input value required to satisfy a quote.
  *
  * Inputs must cover the invoice amount, the mint's fee reserve, and the NUT-02
- * per-input fee. The fee depends on how many proofs are submitted, so pass the
- * count (and the keyset's `input_fee_ppk`) when the mint charges one; against a
- * zero-fee mint the defaults reproduce the old behaviour.
+ * per-input fee. The fee depends on which proofs are submitted, so pass them
+ * (with the keyset rates) when the mint charges one; against a zero-fee mint
+ * the defaults reproduce the old behaviour. A bare count is still accepted for
+ * the single-keyset case.
  */
-export declare const meltAmountRequired: (quote: CashuMeltQuote, nInputs?: number, inputFeePpk?: number) => number;
+export declare const meltAmountRequired: (quote: CashuMeltQuote, inputs?: number | Pick<CashuProof, "id">[], rates?: number | InputFeeRates) => number;
 /** Sum of proof denominations. */
 export declare const sumProofs: (proofs: CashuProof[]) => number;
 /**
@@ -66,6 +86,8 @@ export declare const sumProofs: (proofs: CashuProof[]) => number;
  * returning a short selection that the mint would reject after the card had
  * already burned the slots.
  *
- * @param inputFeePpk the keyset's NUT-02 `input_fee_ppk`, if it charges one
+ * @param rates the keyset's NUT-02 `input_fee_ppk` if a single keyset is in
+ *              play, or an {@link InputFeeRates} map keyed by keyset id when
+ *              the proofs span keysets (a rotation leaves a card holding both)
  */
-export declare const selectProofsForMelt: (proofs: CashuProof[], quote: CashuMeltQuote, inputFeePpk?: number) => CashuProof[] | null;
+export declare const selectProofsForMelt: (proofs: CashuProof[], quote: CashuMeltQuote, rates?: number | InputFeeRates) => CashuProof[] | null;

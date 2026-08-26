@@ -84,6 +84,33 @@ describe("swap balance", () => {
     expect(await swapProofs(MINT, [], [output(1)])).toBeInstanceOf(CashuMintError)
     expect(await swapProofs(MINT, [proof(1)], [])).toBeInstanceOf(CashuMintError)
   })
+
+  it("charges the per-keyset fee when the inputs span a rotation", async () => {
+    // NUT-02 declares input_fee_ppk per keyset. Old proofs are free, new ones
+    // cost 1 sat each, so 12 in means 11 out — not 10 (flat 1000) and not 12
+    // (flat 0). Both flat answers are rejected, one by this check and one by
+    // the mint after the card has burned its slots.
+    const OLD = "00aaaaaaaaaaaaaa"
+    const inputs = [{...proof(8), id: OLD}, proof(4)]
+    const rates = {[OLD]: 0, [KS]: 1000}
+
+    expect(await swapProofs(MINT, inputs, [output(10)], rates)).toBeInstanceOf(
+      CashuMintError,
+    )
+
+    const outputs = [output(8), output(2), output(1)]
+    mockAxios.mockResolvedValueOnce({data: {signatures: sigsFor(outputs)}})
+    expect(await swapProofs(MINT, inputs, outputs, rates)).toHaveLength(3)
+  })
+
+  it("refuses mixed-keyset inputs priced with a single rate", async () => {
+    const inputs = [{...proof(8), id: "00aaaaaaaaaaaaaa"}, proof(4)]
+    const result = await swapProofs(MINT, inputs, [output(10)], 1000)
+
+    expect(result).toBeInstanceOf(CashuMintError)
+    expect((result as Error).message).toMatch(/span 2 keysets/)
+    expect(mockAxios).not.toHaveBeenCalled()
+  })
 })
 
 describe("swap signature binding", () => {
