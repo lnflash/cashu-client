@@ -40,8 +40,11 @@ export declare const meltProofs: (mintUrl: string, quoteId: string, proofs: Cash
  *
  * A wallet that has lived through a keyset rotation holds proofs from more than
  * one keyset, and NUT-02 declares the rate *per keyset* — so the fee is the sum
- * of each input's own rate, rounded once. Build one of these from
- * {@link getMintKeysets}.
+ * of each input's own rate, rounded once.
+ *
+ * Build one with {@link inputFeeRatesFromKeysets} from the mint's `/v1/keysets`
+ * response rather than by hand — a keyset missing from the map is treated as
+ * unpriceable and refused, which is a safety net only if the map is complete.
  */
 export type InputFeeRates = Record<string, number>;
 /**
@@ -60,6 +63,19 @@ export type InputFeeRates = Record<string, number>;
  */
 export declare function inputFee(nInputs: number, inputFeePpk?: number): number;
 export declare function inputFee(inputs: Pick<CashuProof, "id">[], rates: number | InputFeeRates): number;
+/**
+ * Build an {@link InputFeeRates} map from the mint's advertised keysets.
+ *
+ * Use this rather than hand-assembling the map: it guarantees every keyset the
+ * mint declares is present, which is what makes {@link inputFee}'s
+ * "absent means unpriceable" refusal a safety net rather than a nuisance. A
+ * keyset the mint does not advertise stays absent on purpose — proofs from it
+ * cannot be priced and should not be silently treated as free.
+ */
+export declare const inputFeeRatesFromKeysets: (keysets: Array<{
+    id: string;
+    input_fee_ppk?: number;
+}>) => InputFeeRates;
 /**
  * Total input value required to satisfy a quote.
  *
@@ -89,5 +105,12 @@ export declare const sumProofs: (proofs: CashuProof[]) => number;
  * @param rates the keyset's NUT-02 `input_fee_ppk` if a single keyset is in
  *              play, or an {@link InputFeeRates} map keyed by keyset id when
  *              the proofs span keysets (a rotation leaves a card holding both)
+ *
+ * @throws if `rates` cannot price the proofs — a scalar rate against inputs
+ *         spanning keysets, or a map missing one of their keysets. That is a
+ *         caller error rather than a runtime condition (hence a throw and not
+ *         the `null` return, which means "these proofs cannot cover the melt"),
+ *         and it is raised before any proof is selected. Omitting `rates`
+ *         entirely means "this mint charges no input fee" and never throws.
  */
 export declare const selectProofsForMelt: (proofs: CashuProof[], quote: CashuMeltQuote, rates?: number | InputFeeRates) => CashuProof[] | null;

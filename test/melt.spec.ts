@@ -23,6 +23,7 @@ import {
   CashuMintError,
   getMeltQuoteState,
   inputFee,
+  inputFeeRatesFromKeysets,
   meltAmountRequired,
   meltProofs,
   p2pkMessageToSign,
@@ -342,8 +343,41 @@ describe("input fees across keysets", () => {
     expect(inputFee(eleven, 100)).toBe(2)
   })
 
-  it("treats an unknown keyset as zero-fee rather than guessing", () => {
-    expect(inputFee([onKeyset("00cccccccccccccc")(1)], rates)).toBe(0)
+  /**
+   * Absent from the map is UNPRICEABLE, not free. Defaulting it to zero
+   * under-charges: the mint computes a larger fee, the request is short, and it
+   * is refused after the card has already marked its slots spent. An explicit 0
+   * in the map is a different statement and is honoured.
+   */
+  it("refuses a keyset the rate map does not price", () => {
+    expect(() => inputFee([onKeyset("00cccccccccccccc")(1)], rates)).toThrow(
+      /unpriceable, not free/,
+    )
+  })
+
+  it("honours an explicit zero rate", () => {
+    const withZero = {...rates, "00cccccccccccccc": 0}
+    expect(inputFee([onKeyset("00cccccccccccccc")(1)], withZero)).toBe(0)
+  })
+
+  /**
+   * `0` is the default `rates` argument everywhere, so guarding the mixed-keyset
+   * case before checking the rate made any card that had lived through a keyset
+   * rotation throw on selection — against a mint charging no fee at all.
+   */
+  it("prices a mixed-keyset set at zero without complaint when there is no fee", () => {
+    const mixed = [onKeyset(OLD)(1), onKeyset(NEW)(1)]
+    expect(inputFee(mixed, 0)).toBe(0)
+    expect(() => selectProofsForMelt(mixed, quote(1, 0))).not.toThrow()
+  })
+
+  it("builds a complete rate map from the mint's keysets", () => {
+    const built = inputFeeRatesFromKeysets([
+      {id: OLD, input_fee_ppk: 100},
+      {id: NEW},               // mint advertised no rate → an explicit 0
+    ])
+    expect(built).toEqual({[OLD]: 100, [NEW]: 0})
+    expect(inputFee([onKeyset(NEW)(1)], built)).toBe(0)
   })
 
   it("refuses a mixed-keyset set when only a scalar rate is supplied", () => {

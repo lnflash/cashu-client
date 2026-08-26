@@ -297,8 +297,11 @@ export const meltProofs = async (
  *
  * A wallet that has lived through a keyset rotation holds proofs from more than
  * one keyset, and NUT-02 declares the rate *per keyset* — so the fee is the sum
- * of each input's own rate, rounded once. Build one of these from
- * {@link getMintKeysets}.
+ * of each input's own rate, rounded once.
+ *
+ * Build one with {@link inputFeeRatesFromKeysets} from the mint's `/v1/keysets`
+ * response rather than by hand — a keyset missing from the map is treated as
+ * unpriceable and refused, which is a safety net only if the map is complete.
  */
 export type InputFeeRates = Record<string, number>
 
@@ -335,6 +338,13 @@ export function inputFee(
   }
 
   if (typeof rates === "number") {
+    // Zero first, and deliberately before the mixed-keyset guard. `0` is the
+    // default argument on every caller, so guarding first meant that merely
+    // holding proofs from two keysets — which any card that has lived through a
+    // rotation does — made selection throw, against a mint that charges no fee
+    // at all. At a zero rate there is no per-keyset number to get wrong.
+    if (rates === 0) return 0
+
     const ids = new Set(inputs.map(p => p.id))
     if (ids.size > 1) {
       throw new Error(
@@ -342,14 +352,44 @@ export function inputFee(
           "supply a per-keyset input_fee_ppk map, not a single rate",
       )
     }
-    return rates > 0 ? Math.ceil((inputs.length * rates) / 1000) : 0
+    return Math.ceil((inputs.length * rates) / 1000)
+  }
+
+  // A keyset missing from the map is UNPRICEABLE, not free. Defaulting it to 0
+  // under-charges: the mint computes a larger fee, the request comes up short,
+  // and it is refused after the card has already marked its slots spent. Refuse
+  // here instead — the caller who supplied a map is asserting it is complete.
+  const unpriced = [...new Set(inputs.filter(p => rates[p.id] === undefined).map(p => p.id))]
+  if (unpriced.length > 0) {
+    throw new Error(
+      `inputFee: no input_fee_ppk for keyset(s) [${unpriced.join(", ")}] — ` +
+        "a keyset absent from the rate map is unpriceable, not free; " +
+        "add it (0 is a valid rate) or pass a scalar rate",
+    )
   }
 
   // One ceil over the summed ppk, not a ceil per input: rounding each input up
   // separately over-charges a mint that only ever rounds the total.
-  const totalPpk = inputs.reduce((sum, p) => sum + (rates[p.id] ?? 0), 0)
+  const totalPpk = inputs.reduce((sum, p) => sum + rates[p.id], 0)
   return totalPpk > 0 ? Math.ceil(totalPpk / 1000) : 0
 }
+
+/**
+ * Build an {@link InputFeeRates} map from the mint's advertised keysets.
+ *
+ * Use this rather than hand-assembling the map: it guarantees every keyset the
+ * mint declares is present, which is what makes {@link inputFee}'s
+ * "absent means unpriceable" refusal a safety net rather than a nuisance. A
+ * keyset the mint does not advertise stays absent on purpose — proofs from it
+ * cannot be priced and should not be silently treated as free.
+ */
+export const inputFeeRatesFromKeysets = (
+  keysets: Array<{id: string; input_fee_ppk?: number}>,
+): InputFeeRates =>
+  keysets.reduce<InputFeeRates>((rates, ks) => {
+    rates[ks.id] = ks.input_fee_ppk ?? 0
+    return rates
+  }, {})
 
 /** Dispatch to the right {@link inputFee} form from a union-typed caller. */
 const feeFor = (
@@ -437,12 +477,26 @@ const accumulate = (
  * @param rates the keyset's NUT-02 `input_fee_ppk` if a single keyset is in
  *              play, or an {@link InputFeeRates} map keyed by keyset id when
  *              the proofs span keysets (a rotation leaves a card holding both)
+ *
+ * @throws if `rates` cannot price the proofs — a scalar rate against inputs
+ *         spanning keysets, or a map missing one of their keysets. That is a
+ *         caller error rather than a runtime condition (hence a throw and not
+ *         the `null` return, which means "these proofs cannot cover the melt"),
+ *         and it is raised before any proof is selected. Omitting `rates`
+ *         entirely means "this mint charges no input fee" and never throws.
  */
 export const selectProofsForMelt = (
   proofs: CashuProof[],
   quote: CashuMeltQuote,
   rates: number | InputFeeRates = 0,
 ): CashuProof[] | null => {
+  // Price the CALLER'S set once, up front. The accumulator only ever sees the
+  // growing subset, so a mixed-keyset set paired with a scalar rate would slip
+  // through whenever the winning selection happened to land on one keyset —
+  // the refusal would fire or not depending on the denominations, which is the
+  // worst kind of guard. Throwing here makes it deterministic.
+  inputFee(proofs, rates)
+
   const base = quote.amount + quote.feeReserve
 
   const ascending = accumulate(
