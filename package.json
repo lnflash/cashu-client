@@ -1,7 +1,7 @@
 {
   "name": "@lnflash/cashu-client",
-  "version": "0.2.0",
-  "description": "Cashu NFC card client — crypto primitives and Nutshell mint HTTP client",
+  "version": "0.3.0",
+  "description": "Cashu NFC card client — BDHKE crypto, NUT-11 P2PK witnesses, and the full mint/melt/swap spend path",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
