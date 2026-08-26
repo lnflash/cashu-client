@@ -1,3 +1,5 @@
+import type { CashuBlindSignature } from "./types"
+
 /**
  * Base error for all Cashu client errors.
  * Uses numeric codes compatible with Cashu NUT error codes.
@@ -53,5 +55,32 @@ export class CashuInvalidProofError extends CashuError {
 export class CashuInsufficientSlotsError extends CashuError {
   constructor(message = "Insufficient card slots", code = 10005) {
     super(message, code)
+  }
+}
+
+/**
+ * A melt was executed but its quote fields could not be parsed.
+ *
+ * The inputs are already consumed and blind signatures cannot be re-fetched, so
+ * whatever change the mint did return is carried on the error rather than
+ * dropped — one malformed quote field must not cost the caller their change.
+ * Extends CashuMintError so existing `instanceof CashuMintError` checks still
+ * catch it.
+ */
+export class CashuMeltResponseError extends CashuMintError {
+  /** Change signatures recovered from the same response. May be empty. */
+  change: CashuBlindSignature[]
+  /** Per-entry messages for change the mint returned that could not be parsed. */
+  changeErrors: string[]
+
+  constructor(
+    message: string,
+    change: CashuBlindSignature[] = [],
+    changeErrors: string[] = [],
+    code = 10006,
+  ) {
+    super(message, code)
+    this.change = change
+    this.changeErrors = changeErrors
   }
 }

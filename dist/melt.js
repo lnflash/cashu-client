@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.selectProofsForMelt = exports.sumProofs = exports.meltAmountRequired = exports.meltProofs = exports.getMeltQuoteState = exports.requestMeltQuote = void 0;
+exports.selectProofsForMelt = exports.sumProofs = exports.meltAmountRequired = exports.inputFee = exports.meltProofs = exports.getMeltQuoteState = exports.requestMeltQuote = void 0;
 const axios_1 = __importDefault(require("axios"));
 const errors_1 = require("./errors");
 const http_1 = require("./http");
@@ -15,17 +15,38 @@ const witness_1 = require("./witness");
  * card, has the card sign them (NUT-11 witness), and melts them here to settle
  * a Lightning invoice. Without it a card could be loaded and never spent.
  */
-const parseQuoteResponse = (data) => {
+/**
+ * Parse a melt quote body.
+ *
+ * The two endpoints are not the same shape, and conflating them is a real
+ * fund-visibility bug. `amount`/`fee_reserve` are the whole point of the quote
+ * endpoints — without them a caller cannot select proofs — so they are
+ * required there. But the legacy mints this parser deliberately supports (the
+ * ones reporting `paid: bool` instead of `state`) answer POST /v1/melt/bolt11
+ * with only `{paid, change}`; requiring the amounts there would report a melt
+ * that actually settled the invoice as an error. Hence `requireAmounts`.
+ *
+ * A field that is *present* but malformed is rejected in both modes.
+ */
+const parseQuoteResponse = (data, { requireAmounts }) => {
     const quoteId = data.quote;
     const amount = data.amount;
     const feeReserve = data.fee_reserve;
     if (typeof quoteId !== "string" || quoteId.length === 0) {
         return new errors_1.CashuMintError("Melt quote response missing quote id");
     }
-    if (!Number.isInteger(amount) || amount < 0) {
+    // Absent is acceptable only on the execute response; present-but-malformed
+    // never is.
+    const amountOk = amount === undefined
+        ? !requireAmounts
+        : Number.isInteger(amount) && amount >= 0;
+    if (!amountOk) {
         return new errors_1.CashuMintError(`Melt quote returned a non-integer amount: ${String(amount)}`);
     }
-    if (!Number.isInteger(feeReserve) || feeReserve < 0) {
+    const feeReserveOk = feeReserve === undefined
+        ? !requireAmounts
+        : Number.isInteger(feeReserve) && feeReserve >= 0;
+    if (!feeReserveOk) {
         return new errors_1.CashuMintError(`Melt quote returned a non-integer fee_reserve: ${String(feeReserve)}`);
     }
     // Older mints report `paid: bool` instead of `state`. Normalise, because a
@@ -40,12 +61,55 @@ const parseQuoteResponse = (data) => {
     }
     return {
         quoteId,
-        amount: amount,
-        feeReserve: feeReserve,
+        // Absent only on a legacy execute response, where the caller already knows
+        // them from the quote it is executing.
+        amount: amount === undefined ? 0 : amount,
+        feeReserve: feeReserve === undefined ? 0 : feeReserve,
         state,
         expiry: typeof data.expiry === "number" ? data.expiry : 0,
         paymentPreimage: typeof data.payment_preimage === "string" ? data.payment_preimage : null,
     };
+};
+/**
+ * Parse the `change` array of a melt-execute response, independently of the
+ * quote fields.
+ *
+ * Independence is the point: the inputs are consumed by the time this runs and
+ * blind signatures cannot be re-fetched, so a malformed entry — or a malformed
+ * field elsewhere in the response — must not take the recoverable change down
+ * with it. Bad entries are reported, good ones are returned.
+ */
+const parseChange = (raw) => {
+    const change = [];
+    const changeErrors = [];
+    if (!Array.isArray(raw))
+        return { change, changeErrors };
+    for (const [i, entry] of raw.entries()) {
+        if (!entry || typeof entry !== "object") {
+            changeErrors.push(`Melt change signature ${i}: malformed entry`);
+            continue;
+        }
+        if (!(0, http_1.isCompressedPointHex)(entry.C_)) {
+            changeErrors.push(`Melt change signature ${i}: malformed C_`);
+            continue;
+        }
+        if (typeof entry.id !== "string" || !Number.isInteger(entry.amount)) {
+            changeErrors.push(`Melt change signature ${i}: malformed id/amount`);
+            continue;
+        }
+        const dleq = (0, http_1.parseResponseDLEQ)(entry.dleq);
+        if (dleq === null) {
+            changeErrors.push(`Melt change signature ${i}: malformed DLEQ`);
+            continue;
+        }
+        change.push({
+            id: entry.id,
+            amount: entry.amount,
+            C_: entry.C_,
+            ...(dleq ? { dleq } : {}),
+        });
+    }
+    return { change, changeErrors };
 };
 /**
  * NUT-05: ask the mint what it will cost to pay `paymentRequest`.
@@ -67,7 +131,7 @@ const requestMeltQuote = async (mintUrl, paymentRequest, unit) => {
         }
         const url = (0, http_1.sanitizeMintUrl)(mintUrl);
         const { data } = await axios_1.default.post(`${url}/v1/melt/quote/bolt11`, { request: paymentRequest, unit }, http_1.axiosConfig);
-        return parseQuoteResponse(data);
+        return parseQuoteResponse(data, { requireAmounts: true });
     }
     catch (err) {
         return new errors_1.CashuMintError(`Melt quote request failed: ${(0, http_1.describeAxiosError)(err)}`);
@@ -88,7 +152,7 @@ const getMeltQuoteState = async (mintUrl, quoteId) => {
         }
         const url = (0, http_1.sanitizeMintUrl)(mintUrl);
         const { data } = await axios_1.default.get(`${url}/v1/melt/quote/bolt11/${quoteId}`, http_1.axiosConfig);
-        return parseQuoteResponse(data);
+        return parseQuoteResponse(data, { requireAmounts: true });
     }
     catch (err) {
         return new errors_1.CashuMintError(`Melt quote state check failed: ${(0, http_1.describeAxiosError)(err)}`);
@@ -99,7 +163,15 @@ exports.getMeltQuoteState = getMeltQuoteState;
  * NUT-05: execute the melt — hand the mint the proofs and have it pay.
  *
  * @param changeOutputs Optional blinded messages for the unused fee reserve.
- *                      Omit them and any overpaid reserve is kept by the mint.
+ *                      Omit them and any overpaid reserve is kept by the mint —
+ *                      so supply them whenever the selection overpays. See
+ *                      {@link selectProofsForMelt}, which minimises the overpay
+ *                      in the first place.
+ *
+ * If the quote portion of the response cannot be parsed the result is a
+ * {@link CashuMeltResponseError}, which still carries whatever change was
+ * recovered: the inputs are gone by then and blind signatures cannot be
+ * re-fetched, so dropping them would destroy the caller's change outright.
  *
  * Note this is not idempotent at the protocol level: the inputs are consumed
  * when the mint accepts them. On a network error the correct move is
@@ -135,21 +207,18 @@ const meltProofs = async (mintUrl, quoteId, proofs, changeOutputs) => {
             body.outputs = changeOutputs.map(bm => ({ id: bm.id, amount: bm.amount, B_: bm.B_ }));
         }
         const { data } = await axios_1.default.post(`${url}/v1/melt/bolt11`, body, http_1.axiosConfig);
-        const quote = parseQuoteResponse({ ...data, quote: data.quote ?? quoteId });
-        if (quote instanceof errors_1.CashuMintError)
-            return quote;
+        // Parse change first and independently. By this point the inputs are spent
+        // and these blind signatures are the only copy in existence — a malformed
+        // field in the quote portion must not take them with it.
+        const { change, changeErrors } = parseChange(data.change);
+        const quote = parseQuoteResponse({ ...data, quote: data.quote ?? quoteId }, { requireAmounts: false });
+        if (quote instanceof errors_1.CashuMintError) {
+            return new errors_1.CashuMeltResponseError(quote.message, change, changeErrors);
+        }
         if (Array.isArray(data.change)) {
-            const change = [];
-            for (const [i, sig] of data.change.entries()) {
-                if (!(0, http_1.isCompressedPointHex)(sig.C_)) {
-                    return new errors_1.CashuMintError(`Melt change signature ${i}: malformed C_`);
-                }
-                if (typeof sig.id !== "string" || !Number.isInteger(sig.amount)) {
-                    return new errors_1.CashuMintError(`Melt change signature ${i}: malformed id/amount`);
-                }
-                change.push({ id: sig.id, amount: sig.amount, C_: sig.C_ });
-            }
             quote.change = change;
+            if (changeErrors.length > 0)
+                quote.changeErrors = changeErrors;
         }
         return quote;
     }
@@ -159,34 +228,90 @@ const meltProofs = async (mintUrl, quoteId, proofs, changeOutputs) => {
 };
 exports.meltProofs = meltProofs;
 /**
- * Total input value required to satisfy a quote.
- * Inputs must cover the invoice amount plus the mint's fee reserve.
+ * NUT-02 input fee for a request with `nInputs` proofs, in the keyset's base
+ * unit. The mint charges `input_fee_ppk` parts per thousand *per input*, and it
+ * comes out of the inputs — so it is part of what the selection must cover.
  */
-const meltAmountRequired = (quote) => quote.amount + quote.feeReserve;
+const inputFee = (nInputs, inputFeePpk = 0) => inputFeePpk > 0 ? Math.ceil((nInputs * inputFeePpk) / 1000) : 0;
+exports.inputFee = inputFee;
+/**
+ * Total input value required to satisfy a quote.
+ *
+ * Inputs must cover the invoice amount, the mint's fee reserve, and the NUT-02
+ * per-input fee. The fee depends on how many proofs are submitted, so pass the
+ * count (and the keyset's `input_fee_ppk`) when the mint charges one; against a
+ * zero-fee mint the defaults reproduce the old behaviour.
+ */
+const meltAmountRequired = (quote, nInputs = 0, inputFeePpk = 0) => quote.amount + quote.feeReserve + (0, exports.inputFee)(nInputs, inputFeePpk);
 exports.meltAmountRequired = meltAmountRequired;
 /** Sum of proof denominations. */
 const sumProofs = (proofs) => proofs.reduce((total, p) => total + p.amount, 0);
 exports.sumProofs = sumProofs;
+const sortDescending = (proofs) => [...proofs].sort((a, b) => b.amount - a.amount);
 /**
- * Pick enough proofs to cover a melt, largest first.
+ * Accumulate proofs in the given order until the requirement is met, then drop
+ * any that turn out to be unnecessary.
  *
- * Returns null when the set cannot cover it — deliberately, rather than
- * returning a short selection that the mint would reject after the card had
- * already burned the slots.
+ * Pruning walks the chosen set largest-first: removing the largest redundant
+ * proof cuts the overpay by more than removing the smallest, and dropping a
+ * proof also lowers the input fee, so a drop can never make the selection
+ * short. Returns null when the order cannot cover the requirement at all.
  */
-const selectProofsForMelt = (proofs, quote) => {
-    const required = (0, exports.meltAmountRequired)(quote);
-    if ((0, exports.sumProofs)(proofs) < required)
-        return null;
-    const sorted = [...proofs].sort((a, b) => b.amount - a.amount);
+const accumulate = (ordered, base, inputFeePpk) => {
     const chosen = [];
     let total = 0;
-    for (const proof of sorted) {
-        if (total >= required)
-            break;
+    for (const proof of ordered) {
         chosen.push(proof);
         total += proof.amount;
+        if (total >= base + (0, exports.inputFee)(chosen.length, inputFeePpk))
+            break;
     }
-    return total >= required ? chosen : null;
+    if (total < base + (0, exports.inputFee)(chosen.length, inputFeePpk))
+        return null;
+    for (const proof of [...chosen].sort((a, b) => b.amount - a.amount)) {
+        const idx = chosen.indexOf(proof);
+        if (idx === -1)
+            continue;
+        const without = total - proof.amount;
+        if (without >= base + (0, exports.inputFee)(chosen.length - 1, inputFeePpk)) {
+            chosen.splice(idx, 1);
+            total = without;
+        }
+    }
+    return { proofs: chosen, total };
+};
+/**
+ * Pick proofs to cover a melt, minimising what the mint keeps.
+ *
+ * Largest-first alone silently loses money: a card holding [64, 4, 1] paying a
+ * 4-sat invoice with a 1-sat reserve selects the 64 and — since `changeOutputs`
+ * is optional — hands the mint 60 sats of overpay. So two selections are built,
+ * ascending and descending, and the cheaper one wins. Ascending finds the exact
+ * [4, 1]; descending stays available for callers whose real constraint is the
+ * number of card slots or input fees rather than the total, and wins on a tie.
+ *
+ * Returns null when the set cannot cover the melt — deliberately, rather than
+ * returning a short selection that the mint would reject after the card had
+ * already burned the slots.
+ *
+ * @param inputFeePpk the keyset's NUT-02 `input_fee_ppk`, if it charges one
+ */
+const selectProofsForMelt = (proofs, quote, inputFeePpk = 0) => {
+    const base = quote.amount + quote.feeReserve;
+    const ascending = accumulate([...proofs].sort((a, b) => a.amount - b.amount), base, inputFeePpk);
+    const descending = accumulate([...proofs].sort((a, b) => b.amount - a.amount), base, inputFeePpk);
+    if (!ascending)
+        return descending ? sortDescending(descending.proofs) : null;
+    if (!descending)
+        return sortDescending(ascending.proofs);
+    // Smaller total is strictly less value surrendered to the mint. On an exact
+    // tie the cheaper option is the one using fewer proofs — fewer card slots and
+    // a smaller input fee for the same cost.
+    if (descending.total !== ascending.total) {
+        return sortDescending(descending.total < ascending.total ? descending.proofs : ascending.proofs);
+    }
+    return sortDescending(descending.proofs.length <= ascending.proofs.length
+        ? descending.proofs
+        : ascending.proofs);
 };
 exports.selectProofsForMelt = selectProofsForMelt;

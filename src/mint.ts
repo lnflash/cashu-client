@@ -8,7 +8,13 @@ import type {
   CashuKeysetDetail,
 } from "./types"
 import { CashuMintError } from "./errors"
-import { axiosConfig, describeAxiosError, sanitizeMintUrl } from "./http"
+import {
+  axiosConfig,
+  describeAxiosError,
+  isCompressedPointHex,
+  parseResponseDLEQ,
+  sanitizeMintUrl,
+} from "./http"
 
 /**
  * NUT-04: Request a mint quote.
@@ -38,7 +44,7 @@ export const requestMintQuote = async (
       expiry: data.expiry,
     }
   } catch (err) {
-    return new CashuMintError(`Mint quote request failed: ${(err as Error).message}`)
+    return new CashuMintError(`Mint quote request failed: ${describeAxiosError(err)}`)
   }
 }
 
@@ -66,7 +72,7 @@ export const getMintQuoteState = async (
       expiry: data.expiry,
     }
   } catch (err) {
-    return new CashuMintError(`Mint quote state check failed: ${(err as Error).message}`)
+    return new CashuMintError(`Mint quote state check failed: ${describeAxiosError(err)}`)
   }
 }
 
@@ -84,9 +90,34 @@ export const getMintKeysets = async (
       return new CashuMintError("Mint keyset response missing keysets array")
     }
 
-    return data.keysets as CashuKeyset[]
+    // Carry NUT-02 `input_fee_ppk` through rather than discarding it. Against a
+    // mint charging a per-input fee, a melt or swap assembled without it is
+    // short by exactly that fee and is rejected — after the card has already
+    // burned its slots.
+    const keysets: CashuKeyset[] = []
+    for (const [i, raw] of (data.keysets as Array<Record<string, unknown>>).entries()) {
+      if (!raw || typeof raw !== "object") {
+        return new CashuMintError(`Mint keyset ${i}: malformed entry`)
+      }
+      if (typeof raw.id !== "string" || typeof raw.unit !== "string") {
+        return new CashuMintError(`Mint keyset ${i}: malformed id/unit`)
+      }
+      const ppk = raw.input_fee_ppk
+      if (ppk !== undefined && (!Number.isInteger(ppk) || (ppk as number) < 0)) {
+        return new CashuMintError(
+          `Mint keyset ${i}: malformed input_fee_ppk: ${String(ppk)}`,
+        )
+      }
+      keysets.push({
+        id: raw.id,
+        unit: raw.unit,
+        active: raw.active === true,
+        ...(ppk === undefined ? {} : {input_fee_ppk: ppk as number}),
+      })
+    }
+    return keysets
   } catch (err) {
-    return new CashuMintError(`Mint keyset fetch failed: ${(err as Error).message}`)
+    return new CashuMintError(`Mint keyset fetch failed: ${describeAxiosError(err)}`)
   }
 }
 
@@ -114,7 +145,7 @@ export const getMintKeyset = async (
     }
     return ks
   } catch (err) {
-    return new CashuMintError(`Mint keyset keys fetch failed: ${(err as Error).message}`)
+    return new CashuMintError(`Mint keyset keys fetch failed: ${describeAxiosError(err)}`)
   }
 }
 
@@ -150,23 +181,34 @@ export const mintProofs = async (
 
     // Bind each returned signature to the output that was requested. The mint
     // could otherwise reorder or relabel amounts/keysets, producing proofs worth
-    // less than paid or unspendable. (Full NUT-12 DLEQ verification — proving the
-    // mint signed with the advertised key — is tracked as a follow-up.)
-    const rawSigs = data.signatures as Array<{id: string; amount: number; C_: string}>
+    // less than paid or unspendable. The NUT-12 DLEQ is carried through here so
+    // the caller can pair it with the blinding factor `r` and verify offline
+    // (see `proofDLEQFromBlindSignature`); stripping it would leave the whole
+    // dleq module unreachable from the only flow that loads a card.
+    const rawSigs = data.signatures as Array<Record<string, unknown>>
     const result: CashuBlindSignature[] = []
     for (let i = 0; i < rawSigs.length; i++) {
       const sig = rawSigs[i]
       const bm = blindedMessages[i]
       if (sig.id !== bm.id) {
-        return new CashuMintError(`Mint signature ${i}: keyset ID mismatch (expected ${bm.id}, got ${sig.id})`)
+        return new CashuMintError(`Mint signature ${i}: keyset ID mismatch (expected ${bm.id}, got ${String(sig.id)})`)
       }
       if (sig.amount !== bm.amount) {
-        return new CashuMintError(`Mint signature ${i}: amount mismatch (expected ${bm.amount}, got ${sig.amount})`)
+        return new CashuMintError(`Mint signature ${i}: amount mismatch (expected ${bm.amount}, got ${String(sig.amount)})`)
       }
-      if (typeof sig.C_ !== "string" || !/^0[23][0-9a-fA-F]{64}$/.test(sig.C_)) {
+      if (!isCompressedPointHex(sig.C_)) {
         return new CashuMintError(`Mint signature ${i}: malformed C_`)
       }
-      result.push({id: sig.id, amount: sig.amount, C_: sig.C_})
+      const dleq = parseResponseDLEQ(sig.dleq)
+      if (dleq === null) {
+        return new CashuMintError(`Mint signature ${i}: malformed DLEQ`)
+      }
+      result.push({
+        id: sig.id as string,
+        amount: sig.amount as number,
+        C_: sig.C_,
+        ...(dleq ? {dleq} : {}),
+      })
     }
     return result
   } catch (err) {

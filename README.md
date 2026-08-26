@@ -27,18 +27,36 @@ covered:
 
 | Stage | Calls |
 |---|---|
-| **Load** a card | `requestMintQuote` → pay → `mintProofs` → `unblindSignature` |
+| **Load** a card | `requestMintQuote` → pay → `mintProofs` → `unblindSignature` + `proofDLEQFromBlindSignature` |
 | **Verify** what's on it | `verifyProofDLEQ` (offline) or `checkProofStates` (online) |
 | **Spend** at a terminal | `requestMeltQuote` → `selectProofsForMelt` → card signs `p2pkMessageToSign` → `attachP2PKWitness` → `meltProofs` |
 | **Make change** | `swapProofs` |
 
-Two things worth knowing before wiring this up. **Melt and swap are not
-idempotent** — the inputs are consumed when the mint accepts them, so after a
-lost response the correct move is `getMeltQuoteState` or `checkProofStates`,
-never a retry. And **`meltProofs` refuses to submit a proof whose P2PK witness
-is missing or invalid**, because by the time a terminal is assembling a melt the
-card has already marked its slots spent; failing locally leaves the proof
-intact, whereas failing at the mint does not.
+Four things worth knowing before wiring this up.
+
+**Melt and swap are not idempotent** — the inputs are consumed when the mint
+accepts them, so after a lost response the correct move is `getMeltQuoteState`
+or `checkProofStates`, never a retry.
+
+**`meltProofs` refuses to submit a proof whose P2PK witness is missing or
+invalid**, because by the time a terminal is assembling a melt the card has
+already marked its slots spent; failing locally leaves the proof intact, whereas
+failing at the mint does not. The local check honours the secret's `sigflag` and
+`n_sigs` tags, and refuses outright on a tag it does not implement — a check
+looser than the mint's would pass locally and still burn the slots.
+
+**Overpay is silent.** `changeOutputs` on `meltProofs` is optional and anything
+overpaid without them is kept by the mint, so `selectProofsForMelt` minimises
+the overpay rather than taking the largest proof that fits. If the mint charges
+a NUT-02 `input_fee_ppk`, pass it to `selectProofsForMelt` and `swapProofs` —
+otherwise every request is short by exactly the fee and gets rejected.
+
+**The error-returning calls return errors, not falsy values.** These functions
+return `T | CashuMintError` rather than throwing, so check before use.
+`allProofsUnspent` in particular returns `"UNSPENT" | "NOT_UNSPENT" |
+CashuMintError` and never a bare boolean: an error is a truthy object, so a
+boolean union would make `if (await allProofsUnspent(...))` read a mint timeout
+as "safe to accept" — the inverse of the double-spend check's purpose.
 
 ## Install
 
@@ -57,6 +75,8 @@ import {
   splitIntoDenominations,
   createBlindedMessage,
   unblindSignature,
+  proofDLEQFromBlindSignature,
+  verifyProofDLEQ,
   requestMintQuote,
   getMintKeysets,
   getMintKeyset,
@@ -88,13 +108,21 @@ const blindedMessages = blindingData.map((bd, i) => ({
 // 5. Mint proofs (with optional retry logic on "quote not paid")
 const sigs = await mintProofs(MINT_URL, quote.quoteId, blindedMessages)
 
-// 6. Unblind signatures → final proofs
+// 6. Unblind signatures → final proofs, carrying the mint's DLEQ across
+//    (proofDLEQFromBlindSignature pairs the mint's e/s with the blinding
+//    factor r, which is what makes the offline check in step 7 possible)
 const proofs = sigs.map((sig, i) => ({
   id: sig.id,
   amount: sig.amount,
   secret: blindingData[i].secretStr,
-  C: unblindSignature(sig.C_, blindingData[i].r, keysetDetail.keys[String(sig.amount)])
+  C: unblindSignature(sig.C_, blindingData[i].r, keysetDetail.keys[String(sig.amount)]),
+  dleq: proofDLEQFromBlindSignature(sig, blindingData[i].r),
 }))
+
+// 7. Verify offline — no mint contact, no trust in whoever handed these over.
+//    Undefined dleq means the mint emits none; that is a policy call for you.
+const mintKey = amount => keysetDetail.keys[String(amount)]
+const verified = proofs.every(p => !p.dleq || verifyProofDLEQ(p, mintKey(p.amount)))
 ```
 
 ## Spec

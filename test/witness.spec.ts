@@ -141,6 +141,107 @@ describe("P2PK witness", () => {
   })
 })
 
+describe("NUT-11 spending-condition tags", () => {
+  /**
+   * `swapProofs` exists to receive a sender's proofs — secrets this library did
+   * not construct — so these tags are reachable. Accepting on one valid
+   * signature regardless of what the tags say means the local check passes and
+   * the mint still refuses, after the card has burned its slots.
+   */
+  const lockedSecret = (pubkey: string, tags: string[][]): string =>
+    JSON.stringify(["P2PK", {nonce: crypto.randomBytes(32).toString("hex"), data: pubkey, tags}])
+
+  const proofWithTags = (card: ReturnType<typeof makeCardKey>, tags: string[][]) => {
+    const base: CashuProof = {
+      id: "0059534ce0bfa19a",
+      amount: 8,
+      secret: lockedSecret(card.pubHex, tags),
+      C: "02" + crypto.randomBytes(32).toString("hex"),
+    }
+    return attachP2PKWitness(base, [cardSign(card.d, base)])
+  }
+
+  it("accepts an explicit SIG_INPUTS", () => {
+    const card = makeCardKey()
+    expect(verifyP2PKWitness(proofWithTags(card, [["sigflag", "SIG_INPUTS"]]))).toBe(true)
+  })
+
+  it("accepts a secret with no tags at all", () => {
+    const card = makeCardKey()
+    expect(verifyP2PKWitness(proofWithTags(card, []))).toBe(true)
+  })
+
+  it("rejects SIG_ALL — that signature is over a different message", () => {
+    // SIG_ALL signs over every input and output of the request, so a
+    // SIG_INPUTS-shaped signature verifies here and is refused at the mint.
+    const card = makeCardKey()
+    const proof = proofWithTags(card, [["sigflag", "SIG_ALL"]])
+    expect(verifyP2PKWitness(proof)).toBe(false)
+    expect(findUnsignedProofs([proof])).toEqual([0])
+  })
+
+  it("rejects an unrecognised sigflag value", () => {
+    const card = makeCardKey()
+    expect(verifyP2PKWitness(proofWithTags(card, [["sigflag", "SIG_FUTURE"]]))).toBe(false)
+    expect(verifyP2PKWitness(proofWithTags(card, [["sigflag"]]))).toBe(false)
+  })
+
+  it("rejects a single signature against n_sigs 2", () => {
+    const card = makeCardKey()
+    const proof = proofWithTags(card, [["n_sigs", "2"]])
+    expect(parseWitnessSignatures(proof.witness)).toHaveLength(1)
+    expect(verifyP2PKWitness(proof)).toBe(false)
+  })
+
+  it("does not let a repeated signature satisfy n_sigs", () => {
+    const card = makeCardKey()
+    const base: CashuProof = {
+      id: "0059534ce0bfa19a",
+      amount: 8,
+      secret: lockedSecret(card.pubHex, [["n_sigs", "2"]]),
+      C: "02" + crypto.randomBytes(32).toString("hex"),
+    }
+    const sig = cardSign(card.d, base)
+    const proof = attachP2PKWitness(base, [sig, sig])
+    expect(verifyP2PKWitness(proof)).toBe(false)
+  })
+
+  it("accepts n_sigs 2 with two distinct valid signatures", () => {
+    const card = makeCardKey()
+    const base: CashuProof = {
+      id: "0059534ce0bfa19a",
+      amount: 8,
+      secret: lockedSecret(card.pubHex, [["n_sigs", "2"]]),
+      C: "02" + crypto.randomBytes(32).toString("hex"),
+    }
+    // BIP-340 admits distinct valid signatures for the same key and message
+    // when the auxiliary randomness differs.
+    const msg = p2pkMessageToSign(base)
+    const a = Buffer.from(secp.signSchnorr(msg, card.d, Buffer.alloc(32, 1))).toString("hex")
+    const b = Buffer.from(secp.signSchnorr(msg, card.d, Buffer.alloc(32, 2))).toString("hex")
+    expect(a).not.toBe(b)
+    expect(verifyP2PKWitness(attachP2PKWitness(base, [a, b]))).toBe(true)
+  })
+
+  it("rejects a malformed n_sigs", () => {
+    const card = makeCardKey()
+    expect(verifyP2PKWitness(proofWithTags(card, [["n_sigs", "many"]]))).toBe(false)
+    expect(verifyP2PKWitness(proofWithTags(card, [["n_sigs", "0"]]))).toBe(false)
+  })
+
+  it("rejects tags this verifier does not implement rather than ignoring them", () => {
+    const card = makeCardKey()
+    for (const tag of [
+      ["locktime", "1700000000"],
+      ["refund", "02" + "11".repeat(32)],
+      ["pubkeys", "02" + "11".repeat(32)],
+      [],
+    ]) {
+      expect(verifyP2PKWitness(proofWithTags(card, [tag]))).toBe(false)
+    }
+  })
+})
+
 describe("melt helpers", () => {
   const quote = (amount: number, feeReserve: number): CashuMeltQuote => ({
     quoteId: "q",

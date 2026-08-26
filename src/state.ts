@@ -96,17 +96,36 @@ export const checkProofStates = async (
 }
 
 /**
+ * The verdict of {@link allProofsUnspent}.
+ *
+ * Deliberately not a boolean. `boolean | CashuMintError` type-checks but fails
+ * open at runtime: a CashuMintError is a truthy object, so
+ * `if (await allProofsUnspent(...)) acceptPayment()` reads a mint timeout, a
+ * 5xx, or a malformed checkstate response as "all proofs unspent" — the exact
+ * inverse of what this module is for. A string verdict has no truthy shortcut.
+ */
+export type CashuUnspentVerdict = "UNSPENT" | "NOT_UNSPENT"
+
+/**
  * Convenience: are all of these proofs still unspent?
  *
  * Treats PENDING as not-spendable. A pending proof is committed to an in-flight
  * operation, and accepting it as payment is how the same value gets counted
  * twice.
+ *
+ * Callers must compare explicitly and handle the error case:
+ *
+ * ```ts
+ * const verdict = await allProofsUnspent(url, proofs)
+ * if (verdict instanceof CashuMintError) return refuse(verdict)
+ * if (verdict !== "UNSPENT") return refuse("already spent or pending")
+ * ```
  */
 export const allProofsUnspent = async (
   mintUrl: string,
   proofs: CashuProof[],
-): Promise<boolean | CashuMintError> => {
+): Promise<CashuUnspentVerdict | CashuMintError> => {
   const states = await checkProofStates(mintUrl, proofs)
   if (states instanceof CashuMintError) return states
-  return states.every(s => s.state === "UNSPENT")
+  return states.every(s => s.state === "UNSPENT") ? "UNSPENT" : "NOT_UNSPENT"
 }

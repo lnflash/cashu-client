@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.CashuInsufficientSlotsError = exports.CashuInvalidProofError = exports.CashuBlindingError = exports.CashuInvalidCardPubkeyError = exports.CashuMintQuoteNotPaidError = exports.CashuMintError = exports.CashuError = void 0;
+exports.CashuMeltResponseError = exports.CashuInsufficientSlotsError = exports.CashuInvalidProofError = exports.CashuBlindingError = exports.CashuInvalidCardPubkeyError = exports.CashuMintQuoteNotPaidError = exports.CashuMintError = exports.CashuError = void 0;
 /**
  * Base error for all Cashu client errors.
  * Uses numeric codes compatible with Cashu NUT error codes.
@@ -57,3 +57,20 @@ class CashuInsufficientSlotsError extends CashuError {
     }
 }
 exports.CashuInsufficientSlotsError = CashuInsufficientSlotsError;
+/**
+ * A melt was executed but its quote fields could not be parsed.
+ *
+ * The inputs are already consumed and blind signatures cannot be re-fetched, so
+ * whatever change the mint did return is carried on the error rather than
+ * dropped — one malformed quote field must not cost the caller their change.
+ * Extends CashuMintError so existing `instanceof CashuMintError` checks still
+ * catch it.
+ */
+class CashuMeltResponseError extends CashuMintError {
+    constructor(message, change = [], changeErrors = [], code = 10006) {
+        super(message, code);
+        this.change = change;
+        this.changeErrors = changeErrors;
+    }
+}
+exports.CashuMeltResponseError = CashuMeltResponseError;

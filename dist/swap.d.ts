@@ -14,4 +14,4 @@ import { CashuMintError } from "./errors";
  * Inputs are consumed on success. Like melt this is not idempotent: if the
  * response is lost, check the inputs with NUT-07 rather than resubmitting.
  */
-export declare const swapProofs: (mintUrl: string, inputs: CashuProof[], outputs: CashuBlindedMessage[]) => Promise<CashuBlindSignature[] | CashuMintError>;
+export declare const swapProofs: (mintUrl: string, inputs: CashuProof[], outputs: CashuBlindedMessage[], inputFeePpk?: number) => Promise<CashuBlindSignature[] | CashuMintError>;

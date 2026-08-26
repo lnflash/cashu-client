@@ -36,7 +36,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.hasDLEQ = exports.verifyProofDLEQ = exports.verifyBlindSignatureDLEQ = exports.hashE = void 0;
+exports.hasDLEQ = exports.proofDLEQFromBlindSignature = exports.verifyProofDLEQ = exports.verifyBlindSignatureDLEQ = exports.hashE = void 0;
 const crypto_1 = __importDefault(require("crypto"));
 const secp = __importStar(require("tiny-secp256k1"));
 const crypto_2 = require("./crypto");
@@ -189,11 +189,44 @@ const verifyProofDLEQ = (proof, mintPubkeyHex) => {
 };
 exports.verifyProofDLEQ = verifyProofDLEQ;
 /**
- * True when the proof carries no DLEQ at all.
+ * Carry a blind signature's DLEQ onto the proof it unblinds into.
+ *
+ * This is the missing link in the card lifecycle. The mint returns `e`/`s` on
+ * the blind signature; `verifyProofDLEQ` additionally needs `r`, the blinding
+ * factor, which only the client has (it is on the `CashuBlindingData` returned
+ * by `createBlindedMessage`). Pair them here when building the proof:
+ *
+ * ```ts
+ * const proof = {
+ *   id: sig.id,
+ *   amount: sig.amount,
+ *   secret: blindingData[i].secretStr,
+ *   C: unblindSignature(sig.C_, blindingData[i].r, keys[String(sig.amount)]),
+ *   dleq: proofDLEQFromBlindSignature(sig, blindingData[i].r),
+ * }
+ * ```
+ *
+ * Returns undefined when the mint emitted no DLEQ, which is a policy decision
+ * for the caller rather than an error — see {@link hasDLEQ}.
+ */
+const proofDLEQFromBlindSignature = (signature, r) => {
+    if (!signature.dleq)
+        return undefined;
+    return {
+        e: signature.dleq.e,
+        s: signature.dleq.s,
+        r: Buffer.from(r).toString("hex"),
+    };
+};
+exports.proofDLEQFromBlindSignature = proofDLEQFromBlindSignature;
+/**
+ * True when the proof carries a complete DLEQ (`e`, `s` and `r`) to check.
  *
  * Distinguishing "absent" from "invalid" matters: not every mint emits DLEQ,
  * so a missing proof is a policy decision for the caller, whereas a present
- * but failing one means the mint is misbehaving and should be refused.
+ * but failing one means the mint is misbehaving and should be refused. The
+ * response parsers enforce the other half of that split — a present-but-
+ * malformed `dleq` is rejected at parse time rather than quietly dropped.
  */
 const hasDLEQ = (proof) => Boolean(proof.dleq && proof.dleq.e && proof.dleq.s && proof.dleq.r);
 exports.hasDLEQ = hasDLEQ;

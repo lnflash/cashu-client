@@ -98,16 +98,58 @@ export const parseWitnessSignatures = (witness: string | undefined): string[] =>
 }
 
 /**
- * Verify a proof's witness against the key its secret is locked to.
+ * NUT-11 spending-condition tags this verifier actually implements.
+ *
+ * Anything else — `locktime`, `refund`, `pubkeys` — changes what makes a
+ * witness valid in a way the check below does not model, so a secret carrying
+ * one is rejected rather than accepted on the strength of the parts we do
+ * understand. `swapProofs` exists to receive a *sender's* proofs, i.e. secrets
+ * this library did not construct, so these are reachable in practice.
+ */
+const SUPPORTED_TAGS = new Set(["sigflag", "n_sigs"])
+
+/** The spending conditions read off a P2PK secret, or null if unsupported. */
+const readSpendingConditions = (
+  parsedSecret: ParsedP2PKSecret,
+): {requiredSigs: number} | null => {
+  let requiredSigs = 1
+  for (const tag of parsedSecret.tags) {
+    const key = tag[0]
+    if (key === undefined || !SUPPORTED_TAGS.has(key)) return null
+
+    if (key === "sigflag") {
+      // SIG_ALL signs over every input and output of the request, so a
+      // SIG_INPUTS-shaped signature verifies here and is still refused by the
+      // mint. Absent means SIG_INPUTS by default.
+      if (tag[1] !== "SIG_INPUTS") return null
+    }
+
+    if (key === "n_sigs") {
+      const n = Number(tag[1])
+      if (!Number.isInteger(n) || n < 1) return null
+      requiredSigs = Math.max(requiredSigs, n)
+    }
+  }
+  return {requiredSigs}
+}
+
+/**
+ * Verify a proof's witness against the key its secret is locked to, and against
+ * the spending conditions its secret declares.
  *
  * Worth doing before submitting: a mint rejects a bad witness with a generic
  * error *after* the card has already marked the proof spent, so the failure is
  * unrecoverable at exactly the point it is least recoverable. Checking here
- * turns that into a local error with the proof still intact.
+ * turns that into a local error with the proof still intact — but only if the
+ * check is the same one the mint runs, which means honouring `sigflag` and
+ * `n_sigs` rather than accepting on any one valid signature.
  */
 export const verifyP2PKWitness = (proof: CashuProof): boolean => {
   const parsedSecret = parseP2PKSecret(proof.secret)
   if (!parsedSecret) return false
+
+  const conditions = readSpendingConditions(parsedSecret)
+  if (!conditions) return false
 
   const sigs = parseWitnessSignatures(proof.witness)
   if (sigs.length === 0) return false
@@ -124,13 +166,19 @@ export const verifyP2PKWitness = (proof: CashuProof): boolean => {
 
   const msg = p2pkMessageToSign(proof)
 
-  return sigs.some(sig => {
+  // Count *distinct* valid signatures: repeating one signature n times must not
+  // satisfy an n_sigs requirement.
+  const valid = new Set<string>()
+  for (const sig of sigs) {
+    const normalised = sig.toLowerCase()
+    if (valid.has(normalised)) continue
     try {
-      return secp.verifySchnorr(msg, xOnly, Buffer.from(sig, "hex"))
+      if (secp.verifySchnorr(msg, xOnly, Buffer.from(sig, "hex"))) valid.add(normalised)
     } catch {
-      return false
+      // Malformed signature — not a match, keep checking the rest.
     }
-  })
+  }
+  return valid.size >= conditions.requiredSigs
 }
 
 /**

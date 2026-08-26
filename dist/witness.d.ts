@@ -43,12 +43,15 @@ export declare const attachP2PKWitness: (proof: CashuProof, signatures: string[]
 /** Read the signatures back out of a proof's witness field. */
 export declare const parseWitnessSignatures: (witness: string | undefined) => string[];
 /**
- * Verify a proof's witness against the key its secret is locked to.
+ * Verify a proof's witness against the key its secret is locked to, and against
+ * the spending conditions its secret declares.
  *
  * Worth doing before submitting: a mint rejects a bad witness with a generic
  * error *after* the card has already marked the proof spent, so the failure is
  * unrecoverable at exactly the point it is least recoverable. Checking here
- * turns that into a local error with the proof still intact.
+ * turns that into a local error with the proof still intact — but only if the
+ * check is the same one the mint runs, which means honouring `sigflag` and
+ * `n_sigs` rather than accepting on any one valid signature.
  */
 export declare const verifyP2PKWitness: (proof: CashuProof) => boolean;
 /**

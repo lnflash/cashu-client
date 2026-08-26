@@ -34,10 +34,34 @@ export declare const verifyBlindSignatureDLEQ: (signature: CashuBlindSignature &
  */
 export declare const verifyProofDLEQ: (proof: CashuProof, mintPubkeyHex: string) => boolean;
 /**
- * True when the proof carries no DLEQ at all.
+ * Carry a blind signature's DLEQ onto the proof it unblinds into.
+ *
+ * This is the missing link in the card lifecycle. The mint returns `e`/`s` on
+ * the blind signature; `verifyProofDLEQ` additionally needs `r`, the blinding
+ * factor, which only the client has (it is on the `CashuBlindingData` returned
+ * by `createBlindedMessage`). Pair them here when building the proof:
+ *
+ * ```ts
+ * const proof = {
+ *   id: sig.id,
+ *   amount: sig.amount,
+ *   secret: blindingData[i].secretStr,
+ *   C: unblindSignature(sig.C_, blindingData[i].r, keys[String(sig.amount)]),
+ *   dleq: proofDLEQFromBlindSignature(sig, blindingData[i].r),
+ * }
+ * ```
+ *
+ * Returns undefined when the mint emitted no DLEQ, which is a policy decision
+ * for the caller rather than an error — see {@link hasDLEQ}.
+ */
+export declare const proofDLEQFromBlindSignature: (signature: CashuBlindSignature, r: Uint8Array) => CashuDLEQ | undefined;
+/**
+ * True when the proof carries a complete DLEQ (`e`, `s` and `r`) to check.
  *
  * Distinguishing "absent" from "invalid" matters: not every mint emits DLEQ,
  * so a missing proof is a policy decision for the caller, whereas a present
- * but failing one means the mint is misbehaving and should be refused.
+ * but failing one means the mint is misbehaving and should be refused. The
+ * response parsers enforce the other half of that split — a present-but-
+ * malformed `dleq` is rejected at parse time rather than quietly dropped.
  */
 export declare const hasDLEQ: (proof: CashuProof) => boolean;

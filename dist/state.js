@@ -88,11 +88,19 @@ exports.checkProofStates = checkProofStates;
  * Treats PENDING as not-spendable. A pending proof is committed to an in-flight
  * operation, and accepting it as payment is how the same value gets counted
  * twice.
+ *
+ * Callers must compare explicitly and handle the error case:
+ *
+ * ```ts
+ * const verdict = await allProofsUnspent(url, proofs)
+ * if (verdict instanceof CashuMintError) return refuse(verdict)
+ * if (verdict !== "UNSPENT") return refuse("already spent or pending")
+ * ```
  */
 const allProofsUnspent = async (mintUrl, proofs) => {
     const states = await (0, exports.checkProofStates)(mintUrl, proofs);
     if (states instanceof errors_1.CashuMintError)
         return states;
-    return states.every(s => s.state === "UNSPENT");
+    return states.every(s => s.state === "UNSPENT") ? "UNSPENT" : "NOT_UNSPENT";
 };
 exports.allProofsUnspent = allProofsUnspent;

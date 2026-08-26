@@ -33,6 +33,13 @@ export type CashuMeltQuote = {
     paymentPreimage?: string | null;
     /** Overpaid fee returned as blind signatures when change outputs were supplied. */
     change?: CashuBlindSignature[];
+    /**
+     * Change entries the mint returned that could not be parsed, one message per
+     * entry. The melt itself still settled — the inputs are gone either way — so
+     * these are reported alongside the result rather than replacing it. A
+     * non-empty array means some of the overpaid reserve is unrecoverable.
+     */
+    changeErrors?: string[];
 };
 /** NUT-07: the mint's view of a single proof. */
 export type CashuProofState = {
@@ -55,6 +62,12 @@ export type CashuBlindSignature = {
     id: string;
     amount: number;
     C_: string;
+    /**
+     * NUT-12 DLEQ proof, as returned by the mint. Carries `e`/`s` only — `r` is
+     * the client's blinding factor and is added when the signature is unblinded
+     * into a proof (see `proofDLEQFromBlindSignature`).
+     */
+    dleq?: CashuDLEQ;
 };
 export type CashuBlindingData = {
     nonce: string;
@@ -67,6 +80,13 @@ export type CashuKeyset = {
     id: string;
     unit: string;
     active: boolean;
+    /**
+     * NUT-02 input fee, in parts per thousand *per input proof*. The fee a
+     * request owes is `ceil(nInputs * input_fee_ppk / 1000)`, and it comes out of
+     * the inputs — a melt or swap assembled without it is short and is rejected
+     * by the mint. Absent means the mint did not advertise one; treat as 0.
+     */
+    input_fee_ppk?: number;
 };
 export type CashuKeysetDetail = {
     id: string;
