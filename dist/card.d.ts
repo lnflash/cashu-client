@@ -29,5 +29,10 @@ export type CardProofSlot = {
  * burned the slot.
  */
 export declare const reconstructProofFromCard: (slot: CardProofSlot, cardPubkey: string) => CashuProof;
-/** Reconstruct every slot on a card, preserving order. */
+/**
+ * Reconstruct every slot on a card, preserving order.
+ *
+ * A failing slot is reported with its index: `nonce must be 32 bytes` on its own
+ * tells an operator nothing about which of N slots is bad.
+ */
 export declare const reconstructProofsFromCard: (slots: CardProofSlot[], cardPubkey: string) => CashuProof[];

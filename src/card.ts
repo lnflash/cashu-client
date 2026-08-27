@@ -14,6 +14,8 @@
  * See `spec/NUT-XX.md` in lnflash/cashu-javacard —
  * *Reconstructing the full Proof from card storage*.
  */
+import * as secp from "tiny-secp256k1"
+
 import { buildP2PKSecret } from "./crypto"
 import type { CashuProof } from "./types"
 
@@ -51,6 +53,24 @@ const requireHex = (value: string, bytes: number, field: string): string => {
 }
 
 /**
+ * Reject anything that is not an actual point on secp256k1.
+ *
+ * A prefix test is not enough: `02`/`03` is necessary but not sufficient, and an
+ * on-prefix but off-curve value produces a secret locked to a non-point — the
+ * card burns the slot on SPEND_PROOF and the mint then rejects a proof that was
+ * never spendable. `secp.isPoint` is how the rest of this package validates
+ * points (crypto.ts, dleq.ts, witness.ts); the 33-byte length check above
+ * already rejects uncompressed keys, so this subsumes the prefix intent.
+ */
+const requirePoint = (value: string, field: string): void => {
+  if (!secp.isPoint(Buffer.from(value, "hex"))) {
+    throw new Error(
+      `${field} must be a compressed secp256k1 point on the curve, got 0x${value.slice(0, 2)}…`,
+    )
+  }
+}
+
+/**
  * Rebuild a spendable proof from a card slot and the card's public key.
  *
  * The returned proof carries no witness. It is not spendable until the card
@@ -74,18 +94,25 @@ export const reconstructProofFromCard = (
   const C = requireHex(slot.C, 33, "C")
   const pubkey = requireHex(cardPubkey, 33, "cardPubkey")
 
-  if (pubkey[1] !== "2" && pubkey[1] !== "3") {
+  // A NUT-02 v0 id is a 0x00 version byte plus 7 bytes of hash, and 8 bytes is
+  // the only id version that fits the card's field — so a first byte other than
+  // 00 is a corrupted id, which matches no keyset just like a truncated one.
+  if (!keysetId.startsWith("00")) {
     throw new Error(
-      `cardPubkey must be a compressed secp256k1 point (02/03 prefix), got 0x${pubkey.slice(0, 2)}`,
+      `keysetId must be a NUT-02 v0 id (00 version byte), got 0x${keysetId.slice(0, 2)}`,
     )
   }
-  if (C[1] !== "2" && C[1] !== "3") {
-    throw new Error(
-      `C must be a compressed secp256k1 point (02/03 prefix), got 0x${C.slice(0, 2)}`,
-    )
-  }
-  if (!Number.isInteger(slot.amount) || slot.amount <= 0) {
-    throw new Error(`amount must be a positive integer, got ${slot.amount}`)
+  requirePoint(pubkey, "cardPubkey")
+  requirePoint(C, "C")
+  // Cashu denominations are powers of two — splitIntoDenominations never emits
+  // anything else and a mint keyset has no key for amount 3 — so a corrupted
+  // amount byte (8 → 9) yields a proof the mint rejects after the slot is burned.
+  if (
+    !Number.isSafeInteger(slot.amount) ||
+    slot.amount <= 0 ||
+    Math.log2(slot.amount) % 1 !== 0
+  ) {
+    throw new Error(`amount must be a positive power of two, got ${slot.amount}`)
   }
 
   return {
@@ -98,8 +125,20 @@ export const reconstructProofFromCard = (
   }
 }
 
-/** Reconstruct every slot on a card, preserving order. */
+/**
+ * Reconstruct every slot on a card, preserving order.
+ *
+ * A failing slot is reported with its index: `nonce must be 32 bytes` on its own
+ * tells an operator nothing about which of N slots is bad.
+ */
 export const reconstructProofsFromCard = (
   slots: CardProofSlot[],
   cardPubkey: string,
-): CashuProof[] => slots.map(slot => reconstructProofFromCard(slot, cardPubkey))
+): CashuProof[] =>
+  slots.map((slot, i) => {
+    try {
+      return reconstructProofFromCard(slot, cardPubkey)
+    } catch (e) {
+      throw new Error(`slot ${i}: ${(e as Error).message}`)
+    }
+  })

@@ -101,6 +101,13 @@ describe("reconstructProofFromCard", () => {
         .toThrow(/nonce must be 32 bytes/)
     })
 
+    it("keyset id with a non-zero version byte", () => {
+      // 8 bytes is the only NUT-02 id version that fits the card's field, so a
+      // first byte other than 00 is corruption, not a newer id format.
+      expect(() => reconstructProofFromCard(slot({ keysetId: "ff59534ce0bfa19a" }), card.pub))
+        .toThrow(/keysetId must be a NUT-02 v0 id/)
+    })
+
     it("uncompressed C point", () => {
       expect(() => reconstructProofFromCard(slot({ C: "04" + "ab".repeat(32) }), card.pub))
         .toThrow(/C must be a compressed/)
@@ -111,14 +118,45 @@ describe("reconstructProofFromCard", () => {
         .toThrow(/cardPubkey must be a compressed/)
     })
 
+    // A prefix-character test (`v[1] === "2" || v[1] === "3"`) accepts every one
+    // of these; only a curve check rejects them.
+    it("C whose low nibble is 2 but whose prefix byte is not 02/03", () => {
+      const bad = "12" + "ab".repeat(32)
+      expect(secp.isPoint(Buffer.from(bad, "hex"))).toBe(false)
+      expect(() => reconstructProofFromCard(slot({ C: bad }), card.pub))
+        .toThrow(/C must be a compressed/)
+    })
+
+    it("card pubkey whose low nibble is 2 but whose prefix byte is not 02/03", () => {
+      const bad = "12" + "ab".repeat(32)
+      expect(secp.isPoint(Buffer.from(bad, "hex"))).toBe(false)
+      expect(() => reconstructProofFromCard(slot(), bad))
+        .toThrow(/cardPubkey must be a compressed/)
+    })
+
+    it("off-curve C with a valid 02 prefix", () => {
+      const offCurve = "02" + "00".repeat(32)
+      // Asserted so the fixture cannot silently become a valid point.
+      expect(secp.isPoint(Buffer.from(offCurve, "hex"))).toBe(false)
+      expect(() => reconstructProofFromCard(slot({ C: offCurve }), card.pub))
+        .toThrow(/C must be a compressed/)
+    })
+
+    it("off-curve card pubkey with a valid 02 prefix", () => {
+      const offCurve = "02" + "00".repeat(32)
+      expect(secp.isPoint(Buffer.from(offCurve, "hex"))).toBe(false)
+      expect(() => reconstructProofFromCard(slot(), offCurve))
+        .toThrow(/cardPubkey must be a compressed/)
+    })
+
     it("wrong-length pubkey", () => {
       expect(() => reconstructProofFromCard(slot(), "02" + "cd".repeat(20)))
         .toThrow(/cardPubkey must be 33 bytes/)
     })
 
-    it.each([0, -1, 1.5])("non-positive or fractional amount: %p", amount => {
+    it.each([0, -1, 1.5, 3])("non-positive, fractional or non-power-of-two amount: %p", amount => {
       expect(() => reconstructProofFromCard(slot({ amount }), card.pub))
-        .toThrow(/amount must be a positive integer/)
+        .toThrow(/amount must be a positive power of two/)
     })
   })
 })
@@ -136,10 +174,10 @@ describe("reconstructProofsFromCard", () => {
     expect(new Set(proofs.map(p => p.secret)).size).toBe(3)
   })
 
-  it("fails the batch if any slot is malformed", () => {
+  it("fails the batch if any slot is malformed, naming the slot index", () => {
     expect(() =>
       reconstructProofsFromCard([slot(), slot({ nonce: "00" })], card.pub),
-    ).toThrow(/nonce must be 32 bytes/)
+    ).toThrow(/slot 1: nonce must be 32 bytes/)
   })
 
   it("handles an empty card", () => {

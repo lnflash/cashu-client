@@ -1,4 +1,37 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.reconstructProofsFromCard = exports.reconstructProofFromCard = void 0;
 /**
@@ -17,6 +50,7 @@ exports.reconstructProofsFromCard = exports.reconstructProofFromCard = void 0;
  * See `spec/NUT-XX.md` in lnflash/cashu-javacard —
  * *Reconstructing the full Proof from card storage*.
  */
+const secp = __importStar(require("tiny-secp256k1"));
 const crypto_1 = require("./crypto");
 const HEX = /^[0-9a-f]+$/;
 const requireHex = (value, bytes, field) => {
@@ -28,6 +62,21 @@ const requireHex = (value, bytes, field) => {
         throw new Error(`${field} must be ${bytes} bytes (${bytes * 2} hex chars), got ${v.length}`);
     }
     return v;
+};
+/**
+ * Reject anything that is not an actual point on secp256k1.
+ *
+ * A prefix test is not enough: `02`/`03` is necessary but not sufficient, and an
+ * on-prefix but off-curve value produces a secret locked to a non-point — the
+ * card burns the slot on SPEND_PROOF and the mint then rejects a proof that was
+ * never spendable. `secp.isPoint` is how the rest of this package validates
+ * points (crypto.ts, dleq.ts, witness.ts); the 33-byte length check above
+ * already rejects uncompressed keys, so this subsumes the prefix intent.
+ */
+const requirePoint = (value, field) => {
+    if (!secp.isPoint(Buffer.from(value, "hex"))) {
+        throw new Error(`${field} must be a compressed secp256k1 point on the curve, got 0x${value.slice(0, 2)}…`);
+    }
 };
 /**
  * Rebuild a spendable proof from a card slot and the card's public key.
@@ -49,14 +98,21 @@ const reconstructProofFromCard = (slot, cardPubkey) => {
     const nonce = requireHex(slot.nonce, 32, "nonce");
     const C = requireHex(slot.C, 33, "C");
     const pubkey = requireHex(cardPubkey, 33, "cardPubkey");
-    if (pubkey[1] !== "2" && pubkey[1] !== "3") {
-        throw new Error(`cardPubkey must be a compressed secp256k1 point (02/03 prefix), got 0x${pubkey.slice(0, 2)}`);
+    // A NUT-02 v0 id is a 0x00 version byte plus 7 bytes of hash, and 8 bytes is
+    // the only id version that fits the card's field — so a first byte other than
+    // 00 is a corrupted id, which matches no keyset just like a truncated one.
+    if (!keysetId.startsWith("00")) {
+        throw new Error(`keysetId must be a NUT-02 v0 id (00 version byte), got 0x${keysetId.slice(0, 2)}`);
     }
-    if (C[1] !== "2" && C[1] !== "3") {
-        throw new Error(`C must be a compressed secp256k1 point (02/03 prefix), got 0x${C.slice(0, 2)}`);
-    }
-    if (!Number.isInteger(slot.amount) || slot.amount <= 0) {
-        throw new Error(`amount must be a positive integer, got ${slot.amount}`);
+    requirePoint(pubkey, "cardPubkey");
+    requirePoint(C, "C");
+    // Cashu denominations are powers of two — splitIntoDenominations never emits
+    // anything else and a mint keyset has no key for amount 3 — so a corrupted
+    // amount byte (8 → 9) yields a proof the mint rejects after the slot is burned.
+    if (!Number.isSafeInteger(slot.amount) ||
+        slot.amount <= 0 ||
+        Math.log2(slot.amount) % 1 !== 0) {
+        throw new Error(`amount must be a positive power of two, got ${slot.amount}`);
     }
     return {
         id: keysetId,
@@ -68,6 +124,18 @@ const reconstructProofFromCard = (slot, cardPubkey) => {
     };
 };
 exports.reconstructProofFromCard = reconstructProofFromCard;
-/** Reconstruct every slot on a card, preserving order. */
-const reconstructProofsFromCard = (slots, cardPubkey) => slots.map(slot => (0, exports.reconstructProofFromCard)(slot, cardPubkey));
+/**
+ * Reconstruct every slot on a card, preserving order.
+ *
+ * A failing slot is reported with its index: `nonce must be 32 bytes` on its own
+ * tells an operator nothing about which of N slots is bad.
+ */
+const reconstructProofsFromCard = (slots, cardPubkey) => slots.map((slot, i) => {
+    try {
+        return (0, exports.reconstructProofFromCard)(slot, cardPubkey);
+    }
+    catch (e) {
+        throw new Error(`slot ${i}: ${e.message}`);
+    }
+});
 exports.reconstructProofsFromCard = reconstructProofsFromCard;
