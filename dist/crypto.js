@@ -110,6 +110,12 @@ exports.splitIntoDenominations = splitIntoDenominations;
  * `String.format("%02X")` is the idiomatic Java bytes-to-hex. Normalising in
  * every caller instead would put the canonical form in more than one place,
  * which is exactly how the two paths drift apart.
+ *
+ * BREAKING in 0.4.0: this lower-casing changes the output for upper-case input,
+ * so proofs minted by <= 0.3.0 with an upper-case pubkey or nonce are locked to
+ * a secret this function no longer produces. Those cards are redeemed with
+ * `reconstructProofFromCard(slot, cardPubkey, {legacyHexCase: true})`. See
+ * CHANGELOG.md.
  */
 const buildP2PKSecret = (nonce, cardPubkey) => {
     // Use structured serialization to prevent injection via raw string interpolation

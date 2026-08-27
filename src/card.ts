@@ -44,21 +44,37 @@ export type CardProofSlot = {
 
 const HEX = /^[0-9a-f]+$/
 
+/** Every field this module validates. */
+type CardField = "cardPubkey" | "keysetId" | "nonce" | "C" | "amount"
+
 /**
- * The typed error for a rejected field.
+ * Which error class each field's rejection carries.
  *
  * A terminal has to tell "this card's key is bad, abort the whole card" apart
  * from "slot 3 is corrupt, skip it", and regex-matching error messages is not a
  * way to do that. `cardPubkey` belongs to the card; every other field belongs to
  * the single slot being read, so the two get different classes — and different
  * NUT error codes — rather than a bare `Error` each.
+ *
+ * The mapping is a `Record` over the field union rather than a comparison
+ * against the literal `"cardPubkey"`. That class is part of the contract
+ * callers depend on, and a string comparison would let a typo or a renamed
+ * field silently downgrade a card-key failure to `CashuInvalidProofError` with
+ * no compiler complaint; a `Record` makes both the typo and a new field a
+ * compile error.
  */
-const rejection = (field: string, message: string): CashuError =>
-  field === "cardPubkey"
-    ? new CashuInvalidCardPubkeyError(message)
-    : new CashuInvalidProofError(message)
+const FIELD_ERROR: Record<CardField, new (message: string) => CashuError> = {
+  cardPubkey: CashuInvalidCardPubkeyError,
+  keysetId: CashuInvalidProofError,
+  nonce: CashuInvalidProofError,
+  C: CashuInvalidProofError,
+  amount: CashuInvalidProofError,
+}
 
-const requireHex = (value: string, bytes: number, field: string): string => {
+const rejection = (field: CardField, message: string): CashuError =>
+  new FIELD_ERROR[field](message)
+
+const requireHex = (value: string, bytes: number, field: CardField): string => {
   // Checked before `.trim()`. A JS caller or a native reader bridge that omits a
   // field otherwise gets `Cannot read properties of undefined (reading 'trim')`
   // — the one input shape where this module produces a stack trace instead of
@@ -86,16 +102,59 @@ const requireHex = (value: string, bytes: number, field: string): string => {
  * on-prefix but off-curve value produces a secret locked to a non-point — the
  * card burns the slot on SPEND_PROOF and the mint then rejects a proof that was
  * never spendable. `secp.isPoint` is how the rest of this package validates
- * points (crypto.ts, dleq.ts, witness.ts); the 33-byte length check above
- * already rejects uncompressed keys, so this subsumes the prefix intent.
+ * points (crypto.ts, dleq.ts, witness.ts), and the 33-byte length check in
+ * `requireHex` has already rejected uncompressed keys by the time we get here.
+ *
+ * The two failures are reported separately because they send an operator to
+ * different places. A bad prefix is a reader that encoded the point wrong. An
+ * on-prefix, off-curve value is a corrupted or truncated point, and quoting
+ * only its (valid) prefix byte would point at the one part that is *not* the
+ * problem — the misdiagnosis this module exists to eliminate.
  */
-const requirePoint = (value: string, field: string): void => {
-  if (!secp.isPoint(Buffer.from(value, "hex"))) {
+const requirePoint = (value: string, field: CardField): void => {
+  const bytes = Buffer.from(value, "hex")
+  if (bytes[0] !== 0x02 && bytes[0] !== 0x03) {
     throw rejection(
       field,
-      `${field} must be a compressed secp256k1 point on the curve, got 0x${value.slice(0, 2)}…`,
+      `${field} must be a compressed secp256k1 point, got prefix 0x${value.slice(0, 2)}`,
     )
   }
+  if (!secp.isPoint(bytes)) {
+    throw rejection(field, `${field} is not on the secp256k1 curve: ${value}`)
+  }
+}
+
+/**
+ * The pre-0.4.0 P2PK serialization, frozen.
+ *
+ * `buildP2PKSecret` lower-cases the nonce and pubkey as of 0.4.0. A proof minted
+ * by 0.3.0 or earlier from an upper-case reader value committed to
+ * `Y = hash_to_curve(secret-with-upper-case-hex)`, so the canonical secret is a
+ * *different* proof that the mint has never signed — and the card burns the slot
+ * on SPEND_PROOF before the mint ever objects. This reproduces exactly what
+ * those cards were funded with so they stay redeemable.
+ *
+ * Do not "fix" this to normalise: its whole value is being byte-identical to
+ * what the old code emitted. New proofs must use `buildP2PKSecret`.
+ */
+const legacyP2PKSecret = (nonce: string, cardPubkey: string): string =>
+  JSON.stringify([
+    "P2PK",
+    {nonce, data: cardPubkey, tags: [["sigflag", "SIG_INPUTS"]]},
+  ])
+
+/** Options shared by the single-slot and batch reconstruction paths. */
+export type ReconstructCardOptions = {
+  /**
+   * Serialize the secret with the reader's hex case instead of the canonical
+   * lower case — the pre-0.4.0 behaviour.
+   *
+   * Only for redeeming a card funded by <= 0.3.0 through a reader that emitted
+   * upper-case hex (`String.format("%02X")` is the idiomatic Java bytes-to-hex).
+   * Try the default first; fall back to this only if the mint rejects the proof
+   * as unknown. Never mint with it.
+   */
+  legacyHexCase?: boolean
 }
 
 /**
@@ -113,14 +172,22 @@ const requirePoint = (value: string, field: string): void => {
 export const reconstructProofFromCard = (
   slot: CardProofSlot,
   cardPubkey: string,
+  options: ReconstructCardOptions = {},
 ): CashuProof => {
+  // The card key is checked first, and completely, because it is the only
+  // card-level input here: if it is bad, every slot on the card is unusable and
+  // the answer is "abort the card", not "skip this slot". Checked after a slot
+  // field it would be masked by whichever slot also happened to be corrupt, and
+  // a caller scanning `failures` would read a dead card as one bad slot.
+  const pubkey = requireHex(cardPubkey, 33, "cardPubkey")
+  requirePoint(pubkey, "cardPubkey")
+
   // A NUT-02 keyset id is 16 hex chars. Anything shorter is usually an id that
   // was ASCII-encoded into the card's 8-byte field, which truncates it to half
   // an id and matches no keyset at the mint.
   const keysetId = requireHex(slot.keysetId, 8, "keysetId")
   const nonce = requireHex(slot.nonce, 32, "nonce")
   const C = requireHex(slot.C, 33, "C")
-  const pubkey = requireHex(cardPubkey, 33, "cardPubkey")
 
   // A NUT-02 v0 id is a 0x00 version byte plus 7 bytes of hash, and 8 bytes is
   // the only id version that fits the card's field — so a first byte other than
@@ -131,8 +198,13 @@ export const reconstructProofFromCard = (
       `keysetId must be a NUT-02 v0 id (00 version byte), got 0x${keysetId.slice(0, 2)}`,
     )
   }
-  requirePoint(pubkey, "cardPubkey")
   requirePoint(C, "C")
+  // Reported before the range check so a string `"8"` from an untyped reader
+  // bridge does not render as `got 8` — a message that looks like a valid value
+  // and hides the type error. Mirrors requireHex's `typeof` message.
+  if (typeof slot.amount !== "number") {
+    throw rejection("amount", `amount must be a number, got ${typeof slot.amount}`)
+  }
   // Cashu denominations are powers of two — splitIntoDenominations never emits
   // anything else and a mint keyset has no key for amount 3 — so a corrupted
   // amount byte (8 → 9) yields a proof the mint rejects after the slot is burned.
@@ -143,7 +215,12 @@ export const reconstructProofFromCard = (
   ) {
     throw rejection(
       "amount",
-      `amount must be a positive power of two, got ${slot.amount}`,
+      // Quoted the way requireHex quotes, so a rejected value never renders as
+      // something that looks valid. JSON.stringify renders NaN and Infinity as
+      // `null` — which is precisely that failure — so those keep their names.
+      `amount must be a positive power of two, got ${
+        Number.isFinite(slot.amount) ? JSON.stringify(slot.amount) : String(slot.amount)
+      }`,
     )
   }
 
@@ -154,7 +231,9 @@ export const reconstructProofFromCard = (
     // single source of that serialization *and* of its canonical hex case, so
     // the two cannot drift apart. The normalisation above is therefore a no-op
     // on the secret rather than a second, competing canonical form.
-    secret: buildP2PKSecret(nonce, pubkey),
+    secret: options.legacyHexCase
+      ? legacyP2PKSecret(slot.nonce.trim(), cardPubkey.trim())
+      : buildP2PKSecret(nonce, pubkey),
     C,
   }
 }
@@ -180,20 +259,77 @@ const withSlotIndex = (e: unknown, i: number): Error => {
   return wrapped
 }
 
+/** A slot the batch path could not reconstruct, with its position on the card. */
+export type CardSlotFailure = {
+  /** Index into the `slots` array as passed in. */
+  index: number
+  /** The rejection, class and `cause` preserved, prefixed with `slot <i>: `. */
+  error: Error
+}
+
+/** What the batch path returns when `skipInvalid` is set. */
+export type CardReconstructionResult = {
+  /** Every slot that reconstructed, in card order. */
+  proofs: CashuProof[]
+  /** Every slot that did not. Empty when the whole card read cleanly. */
+  failures: CardSlotFailure[]
+}
+
+export type ReconstructCardBatchOptions = ReconstructCardOptions & {
+  /**
+   * Collect failures instead of throwing on the first one.
+   *
+   * Defaults to `false` — one bad slot fails the batch, which is the right
+   * default for spending a card, since a caller that quietly drops a slot spends
+   * less than the holder handed over.
+   *
+   * Set it for the "slot 3 is corrupt, skip it" case: without it, one corrupt
+   * slot makes every other slot on the card unreadable through this API and the
+   * caller has to abandon the batch helper and hand-roll the loop. Check the
+   * failures' error *class* before treating them as per-slot damage — a bad card
+   * key (`CashuInvalidCardPubkeyError`) fails every slot and means abort the
+   * card, not skip a slot.
+   */
+  skipInvalid?: boolean
+}
+
 /**
  * Reconstruct every slot on a card, preserving order.
  *
  * A failing slot is reported with its index: `nonce must be 32 bytes` on its own
  * tells an operator nothing about which of N slots is bad.
+ *
+ * Throws on the first bad slot by default; pass `{skipInvalid: true}` to get
+ * `{proofs, failures}` back instead.
  */
-export const reconstructProofsFromCard = (
+export function reconstructProofsFromCard(
   slots: CardProofSlot[],
   cardPubkey: string,
-): CashuProof[] =>
-  slots.map((slot, i) => {
+  options?: ReconstructCardOptions & {skipInvalid?: false},
+): CashuProof[]
+export function reconstructProofsFromCard(
+  slots: CardProofSlot[],
+  cardPubkey: string,
+  options: ReconstructCardOptions & {skipInvalid: true},
+): CardReconstructionResult
+export function reconstructProofsFromCard(
+  slots: CardProofSlot[],
+  cardPubkey: string,
+  options: ReconstructCardBatchOptions = {},
+): CashuProof[] | CardReconstructionResult {
+  const {skipInvalid = false, ...slotOptions} = options
+  const proofs: CashuProof[] = []
+  const failures: CardSlotFailure[] = []
+
+  slots.forEach((slot, i) => {
     try {
-      return reconstructProofFromCard(slot, cardPubkey)
+      proofs.push(reconstructProofFromCard(slot, cardPubkey, slotOptions))
     } catch (e) {
-      throw withSlotIndex(e, i)
+      const error = withSlotIndex(e, i)
+      if (!skipInvalid) throw error
+      failures.push({index: i, error})
     }
   })
+
+  return skipInvalid ? {proofs, failures} : proofs
+}

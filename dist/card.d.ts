@@ -16,6 +16,19 @@ export type CardProofSlot = {
     /** The mint's unblinded signature at offset 45 — 33 bytes, 66 hex chars. */
     C: string;
 };
+/** Options shared by the single-slot and batch reconstruction paths. */
+export type ReconstructCardOptions = {
+    /**
+     * Serialize the secret with the reader's hex case instead of the canonical
+     * lower case — the pre-0.4.0 behaviour.
+     *
+     * Only for redeeming a card funded by <= 0.3.0 through a reader that emitted
+     * upper-case hex (`String.format("%02X")` is the idiomatic Java bytes-to-hex).
+     * Try the default first; fall back to this only if the mint rejects the proof
+     * as unknown. Never mint with it.
+     */
+    legacyHexCase?: boolean;
+};
 /**
  * Rebuild a spendable proof from a card slot and the card's public key.
  *
@@ -28,11 +41,50 @@ export type CardProofSlot = {
  * worse place to discover it than here — by then the card may already have
  * burned the slot.
  */
-export declare const reconstructProofFromCard: (slot: CardProofSlot, cardPubkey: string) => CashuProof;
+export declare const reconstructProofFromCard: (slot: CardProofSlot, cardPubkey: string, options?: ReconstructCardOptions) => CashuProof;
+/** A slot the batch path could not reconstruct, with its position on the card. */
+export type CardSlotFailure = {
+    /** Index into the `slots` array as passed in. */
+    index: number;
+    /** The rejection, class and `cause` preserved, prefixed with `slot <i>: `. */
+    error: Error;
+};
+/** What the batch path returns when `skipInvalid` is set. */
+export type CardReconstructionResult = {
+    /** Every slot that reconstructed, in card order. */
+    proofs: CashuProof[];
+    /** Every slot that did not. Empty when the whole card read cleanly. */
+    failures: CardSlotFailure[];
+};
+export type ReconstructCardBatchOptions = ReconstructCardOptions & {
+    /**
+     * Collect failures instead of throwing on the first one.
+     *
+     * Defaults to `false` — one bad slot fails the batch, which is the right
+     * default for spending a card, since a caller that quietly drops a slot spends
+     * less than the holder handed over.
+     *
+     * Set it for the "slot 3 is corrupt, skip it" case: without it, one corrupt
+     * slot makes every other slot on the card unreadable through this API and the
+     * caller has to abandon the batch helper and hand-roll the loop. Check the
+     * failures' error *class* before treating them as per-slot damage — a bad card
+     * key (`CashuInvalidCardPubkeyError`) fails every slot and means abort the
+     * card, not skip a slot.
+     */
+    skipInvalid?: boolean;
+};
 /**
  * Reconstruct every slot on a card, preserving order.
  *
  * A failing slot is reported with its index: `nonce must be 32 bytes` on its own
  * tells an operator nothing about which of N slots is bad.
+ *
+ * Throws on the first bad slot by default; pass `{skipInvalid: true}` to get
+ * `{proofs, failures}` back instead.
  */
-export declare const reconstructProofsFromCard: (slots: CardProofSlot[], cardPubkey: string) => CashuProof[];
+export declare function reconstructProofsFromCard(slots: CardProofSlot[], cardPubkey: string, options?: ReconstructCardOptions & {
+    skipInvalid?: false;
+}): CashuProof[];
+export declare function reconstructProofsFromCard(slots: CardProofSlot[], cardPubkey: string, options: ReconstructCardOptions & {
+    skipInvalid: true;
+}): CardReconstructionResult;

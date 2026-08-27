@@ -42,6 +42,13 @@ describe("reconstructProofFromCard", () => {
     expect(proof.id).toBe(s.keysetId)
     expect(proof.amount).toBe(8)
     expect(proof.C).toBe(s.C)
+    // Asserted against the literal serialization, not against
+    // `buildP2PKSecret(...)` — re-deriving the expectation with the function
+    // under test passes as long as it emits the same garbage twice.
+    expect(proof.secret).toBe(
+      `["P2PK",{"nonce":"${s.nonce}","data":"${card.pub}","tags":[["sigflag","SIG_INPUTS"]]}]`,
+    )
+    // And it still agrees with the one function that owns this serialization.
     expect(proof.secret).toBe(buildP2PKSecret(s.nonce, card.pub))
   })
 
@@ -181,16 +188,16 @@ describe("reconstructProofFromCard", () => {
         .toThrow(CashuInvalidProofError)
     })
 
-    it("uncompressed C point", () => {
+    it("uncompressed C point — names the prefix, which is the actual fault", () => {
       expect(() => reconstructProofFromCard(slot({ C: "04" + "ab".repeat(32) }), card.pub))
-        .toThrow(/C must be a compressed/)
+        .toThrow("C must be a compressed secp256k1 point, got prefix 0x04")
       expect(() => reconstructProofFromCard(slot({ C: "04" + "ab".repeat(32) }), card.pub))
         .toThrow(CashuInvalidProofError)
     })
 
-    it("uncompressed card pubkey", () => {
+    it("uncompressed card pubkey — names the prefix, which is the actual fault", () => {
       expect(() => reconstructProofFromCard(slot(), "04" + "cd".repeat(32)))
-        .toThrow(/cardPubkey must be a compressed/)
+        .toThrow("cardPubkey must be a compressed secp256k1 point, got prefix 0x04")
       expect(() => reconstructProofFromCard(slot(), "04" + "cd".repeat(32)))
         .toThrow(CashuInvalidCardPubkeyError)
     })
@@ -215,23 +222,41 @@ describe("reconstructProofFromCard", () => {
         .toThrow(CashuInvalidCardPubkeyError)
     })
 
-    it("off-curve C with a valid 02 prefix", () => {
+    // The prefix is valid here and the *point* is the fault, so the message
+    // must not quote the prefix — blaming the one byte that is correct sends an
+    // operator hunting the reader's prefix encoding for a fault that is not
+    // there, which is the misdiagnosis this module exists to eliminate.
+    it("off-curve C with a valid 02 prefix — blames the point, not the prefix", () => {
       const offCurve = "02" + "00".repeat(32)
       // Asserted so the fixture cannot silently become a valid point.
       expect(secp.isPoint(Buffer.from(offCurve, "hex"))).toBe(false)
       expect(() => reconstructProofFromCard(slot({ C: offCurve }), card.pub))
-        .toThrow(/C must be a compressed/)
+        .toThrow(`C is not on the secp256k1 curve: ${offCurve}`)
+      expect(() => reconstructProofFromCard(slot({ C: offCurve }), card.pub))
+        .not.toThrow(/prefix/)
       expect(() => reconstructProofFromCard(slot({ C: offCurve }), card.pub))
         .toThrow(CashuInvalidProofError)
     })
 
-    it("off-curve card pubkey with a valid 02 prefix", () => {
+    it("off-curve card pubkey with a valid 02 prefix — blames the point, not the prefix", () => {
       const offCurve = "02" + "00".repeat(32)
       expect(secp.isPoint(Buffer.from(offCurve, "hex"))).toBe(false)
       expect(() => reconstructProofFromCard(slot(), offCurve))
-        .toThrow(/cardPubkey must be a compressed/)
+        .toThrow(`cardPubkey is not on the secp256k1 curve: ${offCurve}`)
+      expect(() => reconstructProofFromCard(slot(), offCurve))
+        .not.toThrow(/prefix/)
       expect(() => reconstructProofFromCard(slot(), offCurve))
         .toThrow(CashuInvalidCardPubkeyError)
+    })
+
+    // A bad card key kills the whole card; a bad slot field kills one slot. When
+    // both are wrong the card-level fault has to win, or a caller scanning batch
+    // failures reads a dead card as one skippable slot.
+    it("reports a bad card key ahead of a bad slot field", () => {
+      const bothBad = () =>
+        reconstructProofFromCard(slot({ nonce: "00" }), "04" + "cd".repeat(32))
+      expect(bothBad).toThrow(CashuInvalidCardPubkeyError)
+      expect(bothBad).toThrow(/cardPubkey/)
     })
 
     it("wrong-length pubkey", () => {
@@ -246,6 +271,93 @@ describe("reconstructProofFromCard", () => {
         .toThrow(/amount must be a positive power of two/)
       expect(() => reconstructProofFromCard(slot({ amount }), card.pub))
         .toThrow(CashuInvalidProofError)
+    })
+
+    // A string `"8"` is a *type* error, and rendering it unquoted as `got 8`
+    // reads as a valid value — hiding the one thing the operator needs to see.
+    it("string amount — a reader bridge that never parsed the field", () => {
+      const bad = { ...slot(), amount: "8" } as unknown as CardProofSlot
+      expect(() => reconstructProofFromCard(bad, card.pub))
+        .toThrow("amount must be a number, got string")
+      expect(() => reconstructProofFromCard(bad, card.pub))
+        .toThrow(CashuInvalidProofError)
+    })
+
+    // NaN and Infinity are numbers, so they reach the range check — and
+    // JSON.stringify renders both as `null`, which is the same "looks like a
+    // different, valid value" failure the quoting exists to prevent.
+    it.each([
+      [NaN, "NaN"],
+      [Infinity, "Infinity"],
+    ])("renders %p by name rather than as null", (amount, shown) => {
+      expect(() => reconstructProofFromCard(slot({ amount }), card.pub))
+        .toThrow(`amount must be a positive power of two, got ${shown}`)
+    })
+
+    it("renders a rejected finite amount as itself", () => {
+      expect(() => reconstructProofFromCard(slot({ amount: 3 }), card.pub))
+        .toThrow("amount must be a positive power of two, got 3")
+    })
+
+    it("missing amount", () => {
+      const bad = { ...slot(), amount: undefined } as unknown as CardProofSlot
+      expect(() => reconstructProofFromCard(bad, card.pub))
+        .toThrow("amount must be a number, got undefined")
+    })
+  })
+
+  // The 0.4.0 hex-case canonicalisation changed buildP2PKSecret's output for
+  // upper-case input, so a card funded by <= 0.3.0 through a reader emitting
+  // `String.format("%02X")` is locked to a secret the canonical path no longer
+  // produces. Since SPEND_PROOF burns the slot *before* returning a signature,
+  // discovering that at the mint costs the proof.
+  describe("legacyHexCase — redeeming a card funded before 0.4.0", () => {
+    const upperPub = card.pub.toUpperCase()
+    const upperNonce = slot().nonce.toUpperCase()
+
+    it("reproduces the pre-0.4.0 serialization byte for byte", () => {
+      const proof = reconstructProofFromCard(
+        slot({ nonce: upperNonce }),
+        upperPub,
+        { legacyHexCase: true },
+      )
+      // Exactly what 0.3.0's buildP2PKSecret emitted: no normalisation at all.
+      expect(proof.secret).toBe(
+        `["P2PK",{"nonce":"${upperNonce}","data":"${upperPub}","tags":[["sigflag","SIG_INPUTS"]]}]`,
+      )
+    })
+
+    it("differs from the canonical secret — which is the whole reason it exists", () => {
+      const canonical = reconstructProofFromCard(slot({ nonce: upperNonce }), upperPub)
+      const legacy = reconstructProofFromCard(slot({ nonce: upperNonce }), upperPub, {
+        legacyHexCase: true,
+      })
+      expect(legacy.secret).not.toBe(canonical.secret)
+      // Everything else is still normalised — only the secret is frozen.
+      expect(legacy.id).toBe(canonical.id)
+      expect(legacy.C).toBe(canonical.C)
+    })
+
+    it("is a no-op on lower-case input, so it cannot silently fork the format", () => {
+      const s = slot()
+      expect(reconstructProofFromCard(s, card.pub, { legacyHexCase: true }).secret)
+        .toBe(reconstructProofFromCard(s, card.pub).secret)
+    })
+
+    it("still validates — a legacy read of a corrupt slot is still rejected", () => {
+      expect(() =>
+        reconstructProofFromCard(slot({ nonce: "00" }), card.pub, { legacyHexCase: true }),
+      ).toThrow(/nonce must be 32 bytes/)
+    })
+
+    it("a card signature over a legacy-cased proof still verifies", () => {
+      const proof = reconstructProofFromCard(slot({ nonce: upperNonce }), upperPub, {
+        legacyHexCase: true,
+      })
+      const sig = Buffer.from(
+        secp.signSchnorr(p2pkMessageToSign(proof), card.d),
+      ).toString("hex")
+      expect(verifyP2PKWitness(attachP2PKWitness(proof, [sig]))).toBe(true)
     })
   })
 })
@@ -302,5 +414,69 @@ describe("reconstructProofsFromCard", () => {
 
   it("handles an empty card", () => {
     expect(reconstructProofsFromCard([], card.pub)).toEqual([])
+  })
+
+  // "slot 3 is corrupt, skip it" is the operator need this module documents, and
+  // throwing on the first bad slot makes every *other* slot on the card
+  // unreadable through this API — the caller has to abandon the batch helper and
+  // hand-roll the loop to recover the good ones.
+  describe("skipInvalid — reading a card around a corrupt slot", () => {
+    const slots = [
+      slot({ amount: 1, nonce: "11".repeat(32) }),
+      slot({ amount: 2, nonce: "00" }),
+      slot({ amount: 4, nonce: "33".repeat(32) }),
+    ]
+
+    it("returns the readable slots and reports the rest", () => {
+      const { proofs, failures } = reconstructProofsFromCard(slots, card.pub, {
+        skipInvalid: true,
+      })
+
+      expect(proofs.map(p => p.amount)).toEqual([1, 4])
+      expect(failures).toHaveLength(1)
+      expect(failures[0].index).toBe(1)
+      expect(failures[0].error.message).toBe("slot 1: nonce must be 32 bytes (64 hex chars), got 2")
+    })
+
+    it("preserves the error class so a bad card key stays distinguishable", () => {
+      // A bad card key fails every slot: that is "abort the card", not "skip a
+      // slot", and the caller can only tell by the class.
+      const { proofs, failures } = reconstructProofsFromCard(slots, "04" + "cd".repeat(32), {
+        skipInvalid: true,
+      })
+
+      expect(proofs).toEqual([])
+      expect(failures.map(f => f.index)).toEqual([0, 1, 2])
+      for (const f of failures) {
+        expect(f.error).toBeInstanceOf(CashuInvalidCardPubkeyError)
+      }
+    })
+
+    it("reports an empty failure list for a clean card", () => {
+      const clean = [slot({ amount: 1, nonce: "11".repeat(32) }), slot({ amount: 2 })]
+      const { proofs, failures } = reconstructProofsFromCard(clean, card.pub, {
+        skipInvalid: true,
+      })
+
+      expect(failures).toEqual([])
+      expect(proofs.map(p => p.amount)).toEqual([1, 2])
+    })
+
+    it("still throws by default — dropping a slot silently spends less than the holder handed over", () => {
+      expect(() => reconstructProofsFromCard(slots, card.pub)).toThrow(/slot 1:/)
+      expect(() => reconstructProofsFromCard(slots, card.pub, { skipInvalid: false }))
+        .toThrow(/slot 1:/)
+    })
+
+    it("passes slot options through to each slot", () => {
+      const upperPub = card.pub.toUpperCase()
+      const s = slot({ nonce: slot().nonce.toUpperCase() })
+      const [legacy] = reconstructProofsFromCard([s], upperPub, { legacyHexCase: true })
+
+      expect(legacy.secret).toBe(
+        reconstructProofFromCard(s, upperPub, { legacyHexCase: true }).secret,
+      )
+      expect(legacy.secret).not.toBe(reconstructProofFromCard(s, upperPub).secret)
+    })
   })
 })
