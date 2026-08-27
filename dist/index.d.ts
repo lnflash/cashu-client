@@ -8,4 +8,5 @@ export * from "./swap";
 export * from "./state";
 export * from "./dleq";
 export * from "./card";
+export * from "./cardFile";
 export { sanitizeMintUrl } from "./http";
