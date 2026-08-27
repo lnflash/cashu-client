@@ -154,6 +154,21 @@ describe("buildP2PKSecret", () => {
       `["P2PK",{"nonce":"${nonce}","data":"${pubkey}","tags":[["sigflag","SIG_INPUTS"]]}]`
     expect(buildP2PKSecret(nonce, pubkey)).toBe(expected)
   })
+
+  // The secret is committed to at mint time as UTF-8 bytes and Y =
+  // hash_to_curve(secret) is taken over exactly those bytes, so hex case is not
+  // cosmetic — an upper-case pubkey here and a lower-case one anywhere else are
+  // two different proofs, only one of which the mint ever signed. A Javacard
+  // reader emitting `String.format("%02X")` is the way that happens in practice.
+  it("canonicalises hex case, so upper- and lower-case inputs commit to one secret", () => {
+    const nonce = "916c21b8c67da71e9d02f4e3adc6f30700c152e01a07ae30e3bcc6b55b0c9e5e"
+    const pubkey = "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2"
+
+    expect(buildP2PKSecret(nonce.toUpperCase(), pubkey.toUpperCase()))
+      .toBe(buildP2PKSecret(nonce, pubkey))
+    expect(buildP2PKSecret(nonce.toUpperCase(), pubkey.toUpperCase()))
+      .not.toMatch(/[A-F]/)
+  })
 })
 
 // ---------------------------------------------------------------------------

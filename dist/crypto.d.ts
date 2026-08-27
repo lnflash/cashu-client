@@ -15,9 +15,19 @@ export declare const hashToCurve: (secret: Buffer) => Uint8Array;
 export declare const splitIntoDenominations: (total: number, maxSlots?: number) => number[];
 /**
  * Build the canonical NUT-10 P2PK secret JSON string for a card proof.
- * Serialization MUST have no spaces and fixed key order.
+ * Serialization MUST have no spaces, fixed key order, and lower-case hex.
  *
  * secret = ["P2PK", {"nonce": "<hex>", "data": "<cardPubkey>", "tags": [["sigflag", "SIG_INPUTS"]]}]
+ *
+ * Hex case is canonicalised here, in the one place that owns this serialization.
+ * The secret is committed to at mint time as a UTF-8 byte string —
+ * `Y = hash_to_curve(secret)` — so an upper-case pubkey at mint time and a
+ * lower-case one at reconstruction time are two different secrets and therefore
+ * two different proofs, only one of which the mint has ever signed. Upper-case
+ * hex is not hypothetical: the counterparty is a Javacard reader and
+ * `String.format("%02X")` is the idiomatic Java bytes-to-hex. Normalising in
+ * every caller instead would put the canonical form in more than one place,
+ * which is exactly how the two paths drift apart.
  */
 export declare const buildP2PKSecret: (nonce: string, cardPubkey: string) => string;
 /**

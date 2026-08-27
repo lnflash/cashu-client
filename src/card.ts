@@ -17,6 +17,11 @@
 import * as secp from "tiny-secp256k1"
 
 import { buildP2PKSecret } from "./crypto"
+import {
+  CashuError,
+  CashuInvalidCardPubkeyError,
+  CashuInvalidProofError,
+} from "./errors"
 import type { CashuProof } from "./types"
 
 /**
@@ -39,13 +44,35 @@ export type CardProofSlot = {
 
 const HEX = /^[0-9a-f]+$/
 
+/**
+ * The typed error for a rejected field.
+ *
+ * A terminal has to tell "this card's key is bad, abort the whole card" apart
+ * from "slot 3 is corrupt, skip it", and regex-matching error messages is not a
+ * way to do that. `cardPubkey` belongs to the card; every other field belongs to
+ * the single slot being read, so the two get different classes — and different
+ * NUT error codes — rather than a bare `Error` each.
+ */
+const rejection = (field: string, message: string): CashuError =>
+  field === "cardPubkey"
+    ? new CashuInvalidCardPubkeyError(message)
+    : new CashuInvalidProofError(message)
+
 const requireHex = (value: string, bytes: number, field: string): string => {
+  // Checked before `.trim()`. A JS caller or a native reader bridge that omits a
+  // field otherwise gets `Cannot read properties of undefined (reading 'trim')`
+  // — the one input shape where this module produces a stack trace instead of
+  // the diagnosis it exists to produce.
+  if (typeof value !== "string") {
+    throw rejection(field, `${field} must be a hex string, got ${typeof value}`)
+  }
   const v = value.trim().toLowerCase()
   if (!HEX.test(v)) {
-    throw new Error(`${field} must be hex, got ${JSON.stringify(value)}`)
+    throw rejection(field, `${field} must be hex, got ${JSON.stringify(value)}`)
   }
   if (v.length !== bytes * 2) {
-    throw new Error(
+    throw rejection(
+      field,
       `${field} must be ${bytes} bytes (${bytes * 2} hex chars), got ${v.length}`,
     )
   }
@@ -64,7 +91,8 @@ const requireHex = (value: string, bytes: number, field: string): string => {
  */
 const requirePoint = (value: string, field: string): void => {
   if (!secp.isPoint(Buffer.from(value, "hex"))) {
-    throw new Error(
+    throw rejection(
+      field,
       `${field} must be a compressed secp256k1 point on the curve, got 0x${value.slice(0, 2)}…`,
     )
   }
@@ -98,7 +126,8 @@ export const reconstructProofFromCard = (
   // the only id version that fits the card's field — so a first byte other than
   // 00 is a corrupted id, which matches no keyset just like a truncated one.
   if (!keysetId.startsWith("00")) {
-    throw new Error(
+    throw rejection(
+      "keysetId",
       `keysetId must be a NUT-02 v0 id (00 version byte), got 0x${keysetId.slice(0, 2)}`,
     )
   }
@@ -112,17 +141,43 @@ export const reconstructProofFromCard = (
     slot.amount <= 0 ||
     Math.log2(slot.amount) % 1 !== 0
   ) {
-    throw new Error(`amount must be a positive power of two, got ${slot.amount}`)
+    throw rejection(
+      "amount",
+      `amount must be a positive power of two, got ${slot.amount}`,
+    )
   }
 
   return {
     id: keysetId,
     amount: slot.amount,
     // Byte-identical to what was signed at mint time — buildP2PKSecret is the
-    // single source of that serialization, so the two cannot drift apart.
+    // single source of that serialization *and* of its canonical hex case, so
+    // the two cannot drift apart. The normalisation above is therefore a no-op
+    // on the secret rather than a second, competing canonical form.
     secret: buildP2PKSecret(nonce, pubkey),
     C,
   }
+}
+
+/**
+ * Re-label a slot failure with its index without throwing away what it was.
+ *
+ * Building a fresh bare `Error` would drop both the original stack — pointing
+ * the trace at this wrapper rather than the failing check — and the error class,
+ * so the batch path would erase the very "bad card key" / "bad slot" distinction
+ * {@link rejection} exists to draw. Every `CashuError` subclass takes
+ * `(message, code?)` with the code defaulted, so reconstructing from the
+ * constructor preserves the NUT code too.
+ */
+const withSlotIndex = (e: unknown, i: number): Error => {
+  const message = `slot ${i}: ${e instanceof Error ? e.message : String(e)}`
+  const Ctor = e instanceof CashuError ? (e.constructor as new (m: string) => Error) : Error
+  // `cause` is assigned rather than passed to the constructor: this package
+  // compiles against lib ES2020, whose Error constructor is typed without an
+  // options bag. Readers see the same `.cause` either way (Node >= 18).
+  const wrapped: Error & { cause?: unknown } = new Ctor(message)
+  wrapped.cause = e
+  return wrapped
 }
 
 /**
@@ -139,6 +194,6 @@ export const reconstructProofsFromCard = (
     try {
       return reconstructProofFromCard(slot, cardPubkey)
     } catch (e) {
-      throw new Error(`slot ${i}: ${(e as Error).message}`)
+      throw withSlotIndex(e, i)
     }
   })
