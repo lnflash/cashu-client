@@ -23,6 +23,7 @@ happens here.
 | Module | Description |
 |--------|-------------|
 | `crypto` | NUT-00 `hash_to_curve`, NUT-03 BDHKE blinding/unblinding, NUT-10 P2PK secret serialization, denomination splitting |
+| `card` | Reconstructing a spendable proof from a card's 78-byte slot layout — NUT-10 P2PK secret recovery |
 | `mint` | Nutshell HTTP client — NUT-01 keysets, NUT-04 mint quotes + proof issuance |
 | `witness` | NUT-11 P2PK witnesses — the message a card must sign, attaching its signature, verifying the result |
 | `melt` | NUT-05 melting — quote, execute, and proof selection. **This is how a card gets redeemed.** |
@@ -43,10 +44,21 @@ covered:
 |---|---|
 | **Load** a card | `requestMintQuote` → pay → `mintProofs` → `unblindSignature` + `proofDLEQFromBlindSignature` |
 | **Verify** what's on it | `verifyProofDLEQ` (offline) or `checkProofStates` (online) |
-| **Spend** at a terminal | `requestMeltQuote` → `selectProofsForMelt` → card signs `p2pkMessageToSign` → `attachP2PKWitness` → `meltProofs` |
+| **Spend** at a terminal | `GET_PROOF` → `reconstructProofsFromCard` → `requestMeltQuote` → `selectProofsForMelt` → card signs `p2pkMessageToSign` → `attachP2PKWitness` → `meltProofs` |
 | **Make change** | `swapProofs` |
 
-Four things worth knowing before wiring this up.
+Five things worth knowing before wiring this up.
+
+**A card slot is not a proof.** A NUT-10 P2PK secret is ~150 bytes of JSON and a
+slot is 78 bytes total, so the card stores the 32-byte *nonce* and nothing else;
+`reconstructProofsFromCard` rebuilds the secret from the nonce, the card's public
+key and the fixed tag set. Without that step `GET_PROOF` gives you bytes and no
+`CashuProof` to hand `selectProofsForMelt`. It throws on a malformed slot rather
+than returning a proof the mint will reject — by then the card may already have
+burned the slot on `SPEND_PROOF`. Pass `{skipInvalid: true}` to get
+`{proofs, failures}` back instead and read the rest of a card around one corrupt
+slot; check each failure's class first, since a bad *card key* fails every slot
+and means abort the card, not skip a slot.
 
 **Melt and swap are not idempotent** — the inputs are consumed when the mint
 accepts them, so after a lost response the correct move is `getMeltQuoteState`
@@ -83,7 +95,7 @@ as "safe to accept" — the inverse of the double-spend check's purpose.
 
 ```bash
 # yarn v1 (git dep, no npm publish needed)
-yarn add github:lnflash/cashu-client#v0.1.0
+yarn add github:lnflash/cashu-client#v0.4.0
 
 # or via npm
 npm install @lnflash/cashu-client
@@ -145,6 +157,31 @@ const proofs = sigs.map((sig, i) => ({
 const mintKey = amount => keysetDetail.keys[String(amount)]
 const verified = proofs.every(p => !p.dleq || verifyProofDLEQ(p, mintKey(p.amount)))
 ```
+
+## Compatibility
+
+**0.4.0 changes `buildP2PKSecret` output for upper-case hex input.** It now
+lower-cases the nonce and the card pubkey, so the serialization has one canonical
+form. Proofs minted by **0.3.0 or earlier with an upper-case `cardPubkey` are not
+reconstructable by this version**: the secret is committed to at mint time as
+UTF-8 bytes — `Y = hash_to_curve(secret)` — so the canonical secret is a
+different proof, one the mint has never signed.
+
+Cards funded that way stay redeemable via the escape hatch:
+
+```typescript
+// Try canonical first; fall back only if the mint rejects the proof as unknown.
+const legacy = reconstructProofFromCard(slot, cardPubkey, {legacyHexCase: true})
+```
+
+The hatch freezes the case of `data` only. Pre-0.4.0 `createBlindedMessage`
+generated the nonce here as lower-case hex and never read one off a card, so the
+card key is the only field whose case could ever have reached a minted secret —
+freezing the nonce's too would build a secret no released version ever minted,
+and you would find out at the mint, after `SPEND_PROOF` burned the slot.
+
+Never mint with `legacyHexCase`. It exists to spend what the old code already
+locked, not to produce more of it. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Spec
 

@@ -62,5 +62,10 @@ export const blindSignWithDLEQ = (
   return {C_hex: C_.toString("hex"), dleq: {e: e.toString("hex"), s: s.toString("hex")}}
 }
 
-export const cardPubkey = (): string =>
-  Buffer.from(secp.pointFromScalar(randomScalar(), true)!).toString("hex")
+/** A card: holds `d`, publishes `P = d*G` and signs with Schnorr. */
+export const cardKeypair = (): {d: Buffer; pub: string} => {
+  const d = randomScalar()
+  return {d, pub: Buffer.from(secp.pointFromScalar(d, true)!).toString("hex")}
+}
+
+export const cardPubkey = (): string => cardKeypair().pub
