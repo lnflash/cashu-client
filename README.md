@@ -95,7 +95,7 @@ as "safe to accept" — the inverse of the double-spend check's purpose.
 
 ```bash
 # yarn v1 (git dep, no npm publish needed)
-yarn add github:lnflash/cashu-client#v0.1.0
+yarn add github:lnflash/cashu-client#v0.4.0
 
 # or via npm
 npm install @lnflash/cashu-client
@@ -162,10 +162,10 @@ const verified = proofs.every(p => !p.dleq || verifyProofDLEQ(p, mintKey(p.amoun
 
 **0.4.0 changes `buildP2PKSecret` output for upper-case hex input.** It now
 lower-cases the nonce and the card pubkey, so the serialization has one canonical
-form. Proofs minted by **0.3.0 or earlier with an upper-case `cardPubkey` (or
-nonce) are not reconstructable by this version**: the secret is committed to at
-mint time as UTF-8 bytes — `Y = hash_to_curve(secret)` — so the canonical secret
-is a different proof, one the mint has never signed.
+form. Proofs minted by **0.3.0 or earlier with an upper-case `cardPubkey` are not
+reconstructable by this version**: the secret is committed to at mint time as
+UTF-8 bytes — `Y = hash_to_curve(secret)` — so the canonical secret is a
+different proof, one the mint has never signed.
 
 Cards funded that way stay redeemable via the escape hatch:
 
@@ -173,6 +173,12 @@ Cards funded that way stay redeemable via the escape hatch:
 // Try canonical first; fall back only if the mint rejects the proof as unknown.
 const legacy = reconstructProofFromCard(slot, cardPubkey, {legacyHexCase: true})
 ```
+
+The hatch freezes the case of `data` only. Pre-0.4.0 `createBlindedMessage`
+generated the nonce here as lower-case hex and never read one off a card, so the
+card key is the only field whose case could ever have reached a minted secret —
+freezing the nonce's too would build a secret no released version ever minted,
+and you would find out at the mint, after `SPEND_PROOF` burned the slot.
 
 Never mint with `legacyHexCase`. It exists to spend what the old code already
 locked, not to produce more of it. See [CHANGELOG.md](CHANGELOG.md).

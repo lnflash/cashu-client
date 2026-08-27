@@ -131,8 +131,16 @@ const requirePoint = (value, field) => {
  * on SPEND_PROOF before the mint ever objects. This reproduces exactly what
  * those cards were funded with so they stay redeemable.
  *
- * Do not "fix" this to normalise: its whole value is being byte-identical to
- * what the old code emitted. New proofs must use `buildP2PKSecret`.
+ * **Only `data` can differ in case.** Pre-0.4.0 `createBlindedMessage` generated
+ * the nonce itself (`crypto.randomBytes(32).toString("hex")`), which is always
+ * lower case, so the reader's hex case could only ever reach a mint-time secret
+ * through `cardPubkey`. Freezing the *nonce*'s case too would emit a secret no
+ * version of this library has ever minted — a proof the mint has never signed,
+ * discovered only after SPEND_PROOF has burned the slot. The caller therefore
+ * passes the already-lower-cased nonce and the raw-cased pubkey.
+ *
+ * Do not "fix" this to normalise `data`: its whole value is being byte-identical
+ * to what the old code emitted. New proofs must use `buildP2PKSecret`.
  */
 const legacyP2PKSecret = (nonce, cardPubkey) => JSON.stringify([
     "P2PK",
@@ -196,8 +204,13 @@ const reconstructProofFromCard = (slot, cardPubkey, options = {}) => {
         // single source of that serialization *and* of its canonical hex case, so
         // the two cannot drift apart. The normalisation above is therefore a no-op
         // on the secret rather than a second, competing canonical form.
+        //
+        // The legacy path passes `nonce` (already lower-cased) rather than the raw
+        // slot value, and only `cardPubkey` verbatim: pre-0.4.0 nonces were generated
+        // here as lower-case hex, so freezing the reader's case on that field would
+        // fabricate a secret no mint has ever signed. See legacyP2PKSecret.
         secret: options.legacyHexCase
-            ? legacyP2PKSecret(slot.nonce.trim(), cardPubkey.trim())
+            ? legacyP2PKSecret(nonce, cardPubkey.trim())
             : (0, crypto_1.buildP2PKSecret)(nonce, pubkey),
         C,
     };

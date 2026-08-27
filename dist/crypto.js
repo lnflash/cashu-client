@@ -112,8 +112,10 @@ exports.splitIntoDenominations = splitIntoDenominations;
  * which is exactly how the two paths drift apart.
  *
  * BREAKING in 0.4.0: this lower-casing changes the output for upper-case input,
- * so proofs minted by <= 0.3.0 with an upper-case pubkey or nonce are locked to
- * a secret this function no longer produces. Those cards are redeemed with
+ * so proofs minted by <= 0.3.0 with an upper-case pubkey are locked to a secret
+ * this function no longer produces. (Only the pubkey: `createBlindedMessage`
+ * generated the nonce itself as lower-case hex, so no caller's case ever reached
+ * that field at mint time.) Those cards are redeemed with
  * `reconstructProofFromCard(slot, cardPubkey, {legacyHexCase: true})`. See
  * CHANGELOG.md.
  */

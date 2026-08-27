@@ -13,7 +13,7 @@ import {
   reconstructProofsFromCard,
   verifyP2PKWitness,
 } from "../src"
-import type { CardProofSlot } from "../src"
+import type { CardProofSlot, CardReconstructionResult, CashuProof } from "../src"
 
 const makeCardKey = () => {
   let d: Buffer
@@ -321,9 +321,29 @@ describe("reconstructProofFromCard", () => {
         upperPub,
         { legacyHexCase: true },
       )
-      // Exactly what 0.3.0's buildP2PKSecret emitted: no normalisation at all.
+      // Exactly what 0.3.0's buildP2PKSecret emitted for such a card: the
+      // reader-supplied pubkey verbatim, and a LOWER-case nonce. 0.3.0's
+      // createBlindedMessage generated the nonce itself as
+      // `randomBytes(32).toString("hex")`, so no reader's `%02X` case could ever
+      // reach a minted secret through that field. Freezing the nonce's case too
+      // would emit a secret no version of this library has ever minted — an
+      // unsignable proof discovered only after SPEND_PROOF burned the slot.
       expect(proof.secret).toBe(
-        `["P2PK",{"nonce":"${upperNonce}","data":"${upperPub}","tags":[["sigflag","SIG_INPUTS"]]}]`,
+        `["P2PK",{"nonce":"${slot().nonce}","data":"${upperPub}","tags":[["sigflag","SIG_INPUTS"]]}]`,
+      )
+    })
+
+    // The nonce case is the field the hatch must NOT freeze, so it gets its own
+    // assertion rather than living inside the serialization string above.
+    it("normalises the nonce even in legacy mode — only `data` is frozen", () => {
+      const legacy = reconstructProofFromCard(slot({ nonce: upperNonce }), upperPub, {
+        legacyHexCase: true,
+      })
+      expect(parseP2PKSecret(legacy.secret)!.nonce).toBe(slot().nonce)
+      expect(legacy.secret).not.toContain(upperNonce)
+      // An upper-case nonce read off the card is identical to a lower-case one.
+      expect(legacy.secret).toBe(
+        reconstructProofFromCard(slot(), upperPub, { legacyHexCase: true }).secret,
       )
     })
 
@@ -460,6 +480,44 @@ describe("reconstructProofsFromCard", () => {
 
       expect(failures).toEqual([])
       expect(proofs.map(p => p.amount)).toEqual([1, 2])
+    })
+
+    // ts-jest type-checks this file, so this is a compile-time assertion as much
+    // as a runtime one: with only the two literal overloads, a runtime `boolean`
+    // fails with TS2769 ("Type 'boolean' is not assignable to type 'false'") and
+    // a terminal driving recovery mode from config or from a retry after the
+    // strict pass threw is forced into an `as any`.
+    it("accepts a runtime boolean for skipInvalid, narrowing to the union", () => {
+      const recoveryMode: boolean = slots.length > 0
+      const result = reconstructProofsFromCard(slots, card.pub, {
+        skipInvalid: recoveryMode,
+      })
+
+      // The union return has to be narrowed by the caller, which is the honest
+      // type for a flag whose value is not known until run time.
+      expect(Array.isArray(result)).toBe(false)
+      const { proofs, failures } = result as CardReconstructionResult
+      expect(proofs.map(p => p.amount)).toEqual([1, 4])
+      expect(failures.map(f => f.index)).toEqual([1])
+    })
+
+    it("the literal overloads still keep their precise return types", () => {
+      // No cast, no narrowing: `true` must still resolve to
+      // CardReconstructionResult and `false` to CashuProof[], or the union
+      // overload has swallowed them.
+      const strict: CashuProof[] = reconstructProofsFromCard(
+        [slot({ amount: 1, nonce: "11".repeat(32) })],
+        card.pub,
+        { skipInvalid: false },
+      )
+      const lenient: CardReconstructionResult = reconstructProofsFromCard(
+        slots,
+        card.pub,
+        { skipInvalid: true },
+      )
+
+      expect(strict.map(p => p.amount)).toEqual([1])
+      expect(lenient.failures).toHaveLength(1)
     })
 
     it("still throws by default — dropping a slot silently spends less than the holder handed over", () => {

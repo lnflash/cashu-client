@@ -134,8 +134,16 @@ const requirePoint = (value: string, field: CardField): void => {
  * on SPEND_PROOF before the mint ever objects. This reproduces exactly what
  * those cards were funded with so they stay redeemable.
  *
- * Do not "fix" this to normalise: its whole value is being byte-identical to
- * what the old code emitted. New proofs must use `buildP2PKSecret`.
+ * **Only `data` can differ in case.** Pre-0.4.0 `createBlindedMessage` generated
+ * the nonce itself (`crypto.randomBytes(32).toString("hex")`), which is always
+ * lower case, so the reader's hex case could only ever reach a mint-time secret
+ * through `cardPubkey`. Freezing the *nonce*'s case too would emit a secret no
+ * version of this library has ever minted — a proof the mint has never signed,
+ * discovered only after SPEND_PROOF has burned the slot. The caller therefore
+ * passes the already-lower-cased nonce and the raw-cased pubkey.
+ *
+ * Do not "fix" this to normalise `data`: its whole value is being byte-identical
+ * to what the old code emitted. New proofs must use `buildP2PKSecret`.
  */
 const legacyP2PKSecret = (nonce: string, cardPubkey: string): string =>
   JSON.stringify([
@@ -146,13 +154,15 @@ const legacyP2PKSecret = (nonce: string, cardPubkey: string): string =>
 /** Options shared by the single-slot and batch reconstruction paths. */
 export type ReconstructCardOptions = {
   /**
-   * Serialize the secret with the reader's hex case instead of the canonical
-   * lower case — the pre-0.4.0 behaviour.
+   * Serialize the secret's `data` with the card key's hex case as supplied,
+   * instead of the canonical lower case — the pre-0.4.0 behaviour.
    *
    * Only for redeeming a card funded by <= 0.3.0 through a reader that emitted
    * upper-case hex (`String.format("%02X")` is the idiomatic Java bytes-to-hex).
-   * Try the default first; fall back to this only if the mint rejects the proof
-   * as unknown. Never mint with it.
+   * The nonce is lower-cased either way: pre-0.4.0 it was generated as lower-case
+   * hex on this side, never read off the card, so it could not carry a reader's
+   * case into a minted secret. Try the default first; fall back to this only if
+   * the mint rejects the proof as unknown. Never mint with it.
    */
   legacyHexCase?: boolean
 }
@@ -231,8 +241,13 @@ export const reconstructProofFromCard = (
     // single source of that serialization *and* of its canonical hex case, so
     // the two cannot drift apart. The normalisation above is therefore a no-op
     // on the secret rather than a second, competing canonical form.
+    //
+    // The legacy path passes `nonce` (already lower-cased) rather than the raw
+    // slot value, and only `cardPubkey` verbatim: pre-0.4.0 nonces were generated
+    // here as lower-case hex, so freezing the reader's case on that field would
+    // fabricate a secret no mint has ever signed. See legacyP2PKSecret.
     secret: options.legacyHexCase
-      ? legacyP2PKSecret(slot.nonce.trim(), cardPubkey.trim())
+      ? legacyP2PKSecret(nonce, cardPubkey.trim())
       : buildP2PKSecret(nonce, pubkey),
     C,
   }
@@ -312,6 +327,22 @@ export function reconstructProofsFromCard(
   cardPubkey: string,
   options: ReconstructCardOptions & {skipInvalid: true},
 ): CardReconstructionResult
+/**
+ * Non-literal `skipInvalid`, returning the union.
+ *
+ * Reading a card around corrupt slots is exactly the mode a terminal drives from
+ * config, or from a retry after the strict pass threw — so `skipInvalid` is
+ * routinely a runtime `boolean`. With only the two literal overloads that call
+ * fails to compile (`Type 'boolean' is not assignable to type 'false'`) and the
+ * caller is pushed into an `as any`, which throws away every other type in the
+ * call. This one is listed last so a literal `true`/`false` still matches its
+ * precise overload first and keeps the narrow return type.
+ */
+export function reconstructProofsFromCard(
+  slots: CardProofSlot[],
+  cardPubkey: string,
+  options: ReconstructCardBatchOptions,
+): CashuProof[] | CardReconstructionResult
 export function reconstructProofsFromCard(
   slots: CardProofSlot[],
   cardPubkey: string,

@@ -27,6 +27,7 @@ import {
   attachP2PKWitness,
   CashuMintError,
   createBlindedMessage,
+  hashToCurve,
   hasDLEQ,
   mintProofs,
   p2pkMessageToSign,
@@ -39,7 +40,13 @@ import {
 } from "../src"
 import type { CashuBlindSignature, CashuProof } from "../src"
 
-import { blindSignWithDLEQ, cardKeypair, cardPubkey, makeMint } from "./helpers/nut12"
+import {
+  blindSignWithDLEQ,
+  cardKeypair,
+  cardPubkey,
+  makeMint,
+  randomScalar,
+} from "./helpers/nut12"
 
 const MINT = "https://mint.example.com"
 const KS = "0059534ce0bfa19a"
@@ -252,5 +259,150 @@ describe("load a card, then spend what is actually on it", () => {
 
     expect(proofs.map(p => p.amount)).toEqual([1, 2, 4])
     expect(proofs.map(p => p.secret)).toEqual(minted.map(m => m.bd.secretStr))
+  })
+})
+
+/**
+ * The same round trip for a card funded *before* 0.4.0 canonicalised hex case.
+ *
+ * `card.spec.ts` can only ever assert the hatch against a hand-written string —
+ * and a hand-written expectation is exactly how a wrong serialization gets
+ * frozen in. Nor can a witness check catch it: `verifyP2PKWitness` hex-decodes
+ * `data`, so it returns true for either case, including the one that costs the
+ * proof. The only assertion that proves the hatch works is minting under the old
+ * serialization and checking the rebuilt secret against what the mint signed.
+ *
+ * `verifyProofDLEQ` derives `Y = hash_to_curve(proof.secret)` itself, so it is
+ * an offline "would the mint accept this?" — one byte of drift in the secret and
+ * it returns false.
+ */
+describe("redeem a card funded before 0.4.0", () => {
+  /**
+   * Mint one proof exactly as 0.3.0 did.
+   *
+   * Two details are load-bearing. `data` is the reader's pubkey verbatim, which
+   * is the whole reason the hatch exists. The nonce is generated *here* as
+   * lower-case hex — pre-0.4.0 `createBlindedMessage` did
+   * `crypto.randomBytes(32).toString("hex")` and never read one off a card — so
+   * an upper-case nonce is a value no released version could have minted.
+   */
+  const mintLegacy = async (
+    mint: ReturnType<typeof makeMint>,
+    cardPubAsRead: string,
+    amount: number,
+  ) => {
+    const nonce = randomScalar().toString("hex")
+    const secretStr = JSON.stringify([
+      "P2PK",
+      {nonce, data: cardPubAsRead, tags: [["sigflag", "SIG_INPUTS"]]},
+    ])
+
+    // B_ = hash_to_curve(secret) + r*G, over the *legacy* secret bytes.
+    const Y = hashToCurve(Buffer.from(secretStr, "utf8"))
+    const r = randomScalar()
+    const B_ = Buffer.from(
+      secp.pointAdd(Y, secp.pointFromScalar(r, true)!, true)!,
+    ).toString("hex")
+
+    const signed = blindSignWithDLEQ(mint, B_)
+    mockAxios.mockResolvedValueOnce({
+      data: {signatures: [{id: KS, amount, C_: signed.C_hex, dleq: signed.dleq}]},
+    })
+    const sigs = (await mintProofs(MINT, "quote-legacy", [
+      {id: KS, amount, B_},
+    ])) as CashuBlindSignature[]
+    expect(sigs).not.toBeInstanceOf(Error)
+
+    return {
+      nonce,
+      secretStr,
+      C: unblindSignature(sigs[0].C_, r, mint.AHex),
+      dleq: proofDLEQFromBlindSignature(sigs[0], r)!,
+    }
+  }
+
+  it("rebuilds the exact secret a %02X reader minted, and the mint would take it", async () => {
+    const mint = makeMint()
+    const card = cardKeypair()
+    const pubAsRead = card.pub.toUpperCase()
+    const minted = await mintLegacy(mint, pubAsRead, 8)
+
+    // The reader hands both fields back upper-cased, nonce included.
+    const rebuilt = reconstructProofFromCard(
+      {keysetId: KS, amount: 8, nonce: minted.nonce.toUpperCase(), C: minted.C},
+      pubAsRead,
+      {legacyHexCase: true},
+    )
+
+    expect(rebuilt.secret).toBe(minted.secretStr)
+    // Offline proof that the mint's signature is over this exact secret.
+    expect(verifyProofDLEQ({...rebuilt, dleq: minted.dleq}, mint.AHex)).toBe(true)
+  })
+
+  it("the default path cannot redeem it — which is why the hatch exists", async () => {
+    const mint = makeMint()
+    const card = cardKeypair()
+    const pubAsRead = card.pub.toUpperCase()
+    const minted = await mintLegacy(mint, pubAsRead, 8)
+
+    const canonical = reconstructProofFromCard(
+      {keysetId: KS, amount: 8, nonce: minted.nonce.toUpperCase(), C: minted.C},
+      pubAsRead,
+    )
+
+    expect(canonical.secret).not.toBe(minted.secretStr)
+    expect(verifyProofDLEQ({...canonical, dleq: minted.dleq}, mint.AHex)).toBe(false)
+  })
+
+  it("the legacy-rebuilt proof is spendable once the card signs it", async () => {
+    const mint = makeMint()
+    const card = cardKeypair()
+    const pubAsRead = card.pub.toUpperCase()
+    const minted = await mintLegacy(mint, pubAsRead, 4)
+
+    const rebuilt = reconstructProofFromCard(
+      {keysetId: KS, amount: 4, nonce: minted.nonce.toUpperCase(), C: minted.C},
+      pubAsRead,
+      {legacyHexCase: true},
+    )
+    const sig = Buffer.from(
+      secp.signSchnorr(p2pkMessageToSign(rebuilt), card.d),
+    ).toString("hex")
+
+    expect(verifyP2PKWitness(attachP2PKWitness(rebuilt, [sig]))).toBe(true)
+  })
+
+  it("a card funded by 0.4.0 through the same %02X reader still redeems by default", async () => {
+    // The hatch is for old *proofs*, not old readers: 0.4.0 lower-cases at mint
+    // time, so an upper-case reader on a current card is a no-op on the default
+    // path — and the hatch must not be needed there.
+    const mint = makeMint()
+    const card = cardKeypair()
+    const bd = createBlindedMessage(KS, 2, card.pub.toUpperCase())
+    const signed = blindSignWithDLEQ(mint, bd.B_)
+    mockAxios.mockResolvedValueOnce({
+      data: {signatures: [{id: KS, amount: 2, C_: signed.C_hex, dleq: signed.dleq}]},
+    })
+    const sigs = (await mintProofs(MINT, "quote-1", [
+      {id: KS, amount: 2, B_: bd.B_},
+    ])) as CashuBlindSignature[]
+
+    const rebuilt = reconstructProofFromCard(
+      {
+        keysetId: KS,
+        amount: 2,
+        nonce: bd.nonce.toUpperCase(),
+        C: unblindSignature(sigs[0].C_, bd.r, mint.AHex),
+      },
+      card.pub.toUpperCase(),
+    )
+
+    expect(rebuilt.secret).toBe(bd.secretStr)
+    expect(
+      verifyProofDLEQ(
+        {...rebuilt, dleq: proofDLEQFromBlindSignature(sigs[0], bd.r)},
+        mint.AHex,
+      ),
+    ).toBe(true)
   })
 })

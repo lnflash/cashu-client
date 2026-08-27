@@ -19,13 +19,15 @@ export type CardProofSlot = {
 /** Options shared by the single-slot and batch reconstruction paths. */
 export type ReconstructCardOptions = {
     /**
-     * Serialize the secret with the reader's hex case instead of the canonical
-     * lower case — the pre-0.4.0 behaviour.
+     * Serialize the secret's `data` with the card key's hex case as supplied,
+     * instead of the canonical lower case — the pre-0.4.0 behaviour.
      *
      * Only for redeeming a card funded by <= 0.3.0 through a reader that emitted
      * upper-case hex (`String.format("%02X")` is the idiomatic Java bytes-to-hex).
-     * Try the default first; fall back to this only if the mint rejects the proof
-     * as unknown. Never mint with it.
+     * The nonce is lower-cased either way: pre-0.4.0 it was generated as lower-case
+     * hex on this side, never read off the card, so it could not carry a reader's
+     * case into a minted secret. Try the default first; fall back to this only if
+     * the mint rejects the proof as unknown. Never mint with it.
      */
     legacyHexCase?: boolean;
 };
@@ -88,3 +90,15 @@ export declare function reconstructProofsFromCard(slots: CardProofSlot[], cardPu
 export declare function reconstructProofsFromCard(slots: CardProofSlot[], cardPubkey: string, options: ReconstructCardOptions & {
     skipInvalid: true;
 }): CardReconstructionResult;
+/**
+ * Non-literal `skipInvalid`, returning the union.
+ *
+ * Reading a card around corrupt slots is exactly the mode a terminal drives from
+ * config, or from a retry after the strict pass threw — so `skipInvalid` is
+ * routinely a runtime `boolean`. With only the two literal overloads that call
+ * fails to compile (`Type 'boolean' is not assignable to type 'false'`) and the
+ * caller is pushed into an `as any`, which throws away every other type in the
+ * call. This one is listed last so a literal `true`/`false` still matches its
+ * precise overload first and keeps the narrow return type.
+ */
+export declare function reconstructProofsFromCard(slots: CardProofSlot[], cardPubkey: string, options: ReconstructCardBatchOptions): CashuProof[] | CardReconstructionResult;
