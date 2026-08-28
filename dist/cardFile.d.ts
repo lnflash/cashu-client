@@ -17,8 +17,8 @@ export type CardFile = {
  * Validate one slot from a file.
  *
  * Strict on purpose, and it throws the same classes `reconstructProofFromCard`
- * does, so a caller can tell "this card's key is wrong" from "slot 3 is
- * corrupt" without matching on message text.
+ * does — because it runs the same checks — so a caller can tell "this card's
+ * key is wrong" from "slot 3 is corrupt" without matching on message text.
  */
 export declare const parseCardSlot: (value: unknown, index: number) => CardProofSlot;
 /**
@@ -32,9 +32,16 @@ export declare const parseCardFile: (input: string | unknown) => CardFile;
 /**
  * Serialize a card file.
  *
- * Round-trips through `parseCardFile` before writing, so a malformed file is
- * caught here rather than by whatever reads it next — which, on the load path,
- * is a card.
+ * Round-trips through `parseCardFile` and then through the *redeem* path —
+ * `reconstructProofsFromCard`, whose result is discarded — before writing. This
+ * is the only place the mint → card direction is checked at all, and the
+ * checks it adds over parsing (curve membership above all) are exactly the ones
+ * that cannot be caught later: cardctl does no curve math, so an on-prefix,
+ * off-curve `C` reaches the card, burns the slot on SPEND_PROOF, and only then
+ * is rejected by the mint as a proof that was never spendable.
+ *
+ * Reusing the redeem path rather than restating its rules is the point: what
+ * this writes is, by construction, what that reads.
  */
 export declare const serializeCardFile: (file: Omit<CardFile, "version">, { pretty }?: {
     pretty?: boolean;

@@ -44,8 +44,13 @@ export type CardProofSlot = {
 
 const HEX = /^[0-9a-f]+$/
 
-/** Every field this module validates. */
-type CardField = "cardPubkey" | "keysetId" | "nonce" | "C" | "amount"
+/**
+ * Every field this module validates.
+ *
+ * Exported because `cardFile.ts` validates these same fields on the way in from
+ * a file and reuses the checks below rather than restating them.
+ */
+export type CardField = "cardPubkey" | "keysetId" | "nonce" | "C" | "amount"
 
 /**
  * Which error class each field's rejection carries.
@@ -74,22 +79,39 @@ const FIELD_ERROR: Record<CardField, new (message: string) => CashuError> = {
 const rejection = (field: CardField, message: string): CashuError =>
   new FIELD_ERROR[field](message)
 
-const requireHex = (value: string, bytes: number, field: CardField): string => {
+/**
+ * Lower-cased, length-checked hex, or the field's own rejection class.
+ *
+ * `where` prefixes the message with the caller's context (`"slot 3: "`), which
+ * is what lets `cardFile.ts` reuse this verbatim instead of keeping a second
+ * copy that drifts. Empty by default, so the messages this module produces are
+ * unchanged and the batch path keeps adding its own `slot <i>: ` prefix.
+ *
+ * `value` is `unknown` rather than `string` on purpose: the typeof check below
+ * is the whole reason a caller reaches for this, and typing the parameter as
+ * `string` would push every caller holding parsed-JSON data into a cast.
+ */
+export const requireHex = (
+  value: unknown,
+  bytes: number,
+  field: CardField,
+  where = "",
+): string => {
   // Checked before `.trim()`. A JS caller or a native reader bridge that omits a
   // field otherwise gets `Cannot read properties of undefined (reading 'trim')`
   // — the one input shape where this module produces a stack trace instead of
   // the diagnosis it exists to produce.
   if (typeof value !== "string") {
-    throw rejection(field, `${field} must be a hex string, got ${typeof value}`)
+    throw rejection(field, `${where}${field} must be a hex string, got ${typeof value}`)
   }
   const v = value.trim().toLowerCase()
   if (!HEX.test(v)) {
-    throw rejection(field, `${field} must be hex, got ${JSON.stringify(value)}`)
+    throw rejection(field, `${where}${field} must be hex, got ${JSON.stringify(value)}`)
   }
   if (v.length !== bytes * 2) {
     throw rejection(
       field,
-      `${field} must be ${bytes} bytes (${bytes * 2} hex chars), got ${v.length}`,
+      `${where}${field} must be ${bytes} bytes (${bytes * 2} hex chars), got ${v.length}`,
     )
   }
   return v
@@ -111,17 +133,64 @@ const requireHex = (value: string, bytes: number, field: CardField): string => {
  * only its (valid) prefix byte would point at the one part that is *not* the
  * problem — the misdiagnosis this module exists to eliminate.
  */
-const requirePoint = (value: string, field: CardField): void => {
+export const requirePoint = (value: string, field: CardField, where = ""): void => {
   const bytes = Buffer.from(value, "hex")
   if (bytes[0] !== 0x02 && bytes[0] !== 0x03) {
     throw rejection(
       field,
-      `${field} must be a compressed secp256k1 point, got prefix 0x${value.slice(0, 2)}`,
+      `${where}${field} must be a compressed secp256k1 point, got prefix 0x${value.slice(0, 2)}`,
     )
   }
   if (!secp.isPoint(bytes)) {
-    throw rejection(field, `${field} is not on the secp256k1 curve: ${value}`)
+    throw rejection(field, `${where}${field} is not on the secp256k1 curve: ${value}`)
   }
+}
+
+/**
+ * A NUT-02 v0 id is a 0x00 version byte plus 7 bytes of hash, and 8 bytes is
+ * the only id version that fits the card's field — so a first byte other than
+ * 00 is a corrupted id, which matches no keyset just like a truncated one.
+ *
+ * Split out of {@link reconstructProofFromCard} so the file parser applies the
+ * same rule; the caller has already run the value through {@link requireHex}.
+ */
+export const requireKeysetV0 = (keysetId: string, where = ""): void => {
+  if (!keysetId.startsWith("00")) {
+    throw rejection(
+      "keysetId",
+      `${where}keysetId must be a NUT-02 v0 id (00 version byte), got 0x${keysetId.slice(0, 2)}`,
+    )
+  }
+}
+
+/**
+ * A Cashu denomination: a positive power of two, safely representable.
+ *
+ * `splitIntoDenominations` never emits anything else and a mint keyset has no
+ * key for amount 3, so a corrupted amount byte (8 → 9) yields a proof the mint
+ * rejects after the slot is burned. Shared with the file parser for exactly
+ * that reason — a file is written before anything is loaded onto a card, which
+ * is the last place the bad amount can be caught for free.
+ */
+export const requireAmount = (value: unknown, where = ""): number => {
+  // Reported before the range check so a string `"8"` from an untyped reader
+  // bridge does not render as `got 8` — a message that looks like a valid value
+  // and hides the type error. Mirrors requireHex's `typeof` message.
+  if (typeof value !== "number") {
+    throw rejection("amount", `${where}amount must be a number, got ${typeof value}`)
+  }
+  if (!Number.isSafeInteger(value) || value <= 0 || Math.log2(value) % 1 !== 0) {
+    throw rejection(
+      "amount",
+      // Quoted the way requireHex quotes, so a rejected value never renders as
+      // something that looks valid. JSON.stringify renders NaN and Infinity as
+      // `null` — which is precisely that failure — so those keep their names.
+      `${where}amount must be a positive power of two, got ${
+        Number.isFinite(value) ? JSON.stringify(value) : String(value)
+      }`,
+    )
+  }
+  return value
 }
 
 /**
@@ -199,40 +268,9 @@ export const reconstructProofFromCard = (
   const nonce = requireHex(slot.nonce, 32, "nonce")
   const C = requireHex(slot.C, 33, "C")
 
-  // A NUT-02 v0 id is a 0x00 version byte plus 7 bytes of hash, and 8 bytes is
-  // the only id version that fits the card's field — so a first byte other than
-  // 00 is a corrupted id, which matches no keyset just like a truncated one.
-  if (!keysetId.startsWith("00")) {
-    throw rejection(
-      "keysetId",
-      `keysetId must be a NUT-02 v0 id (00 version byte), got 0x${keysetId.slice(0, 2)}`,
-    )
-  }
+  requireKeysetV0(keysetId)
   requirePoint(C, "C")
-  // Reported before the range check so a string `"8"` from an untyped reader
-  // bridge does not render as `got 8` — a message that looks like a valid value
-  // and hides the type error. Mirrors requireHex's `typeof` message.
-  if (typeof slot.amount !== "number") {
-    throw rejection("amount", `amount must be a number, got ${typeof slot.amount}`)
-  }
-  // Cashu denominations are powers of two — splitIntoDenominations never emits
-  // anything else and a mint keyset has no key for amount 3 — so a corrupted
-  // amount byte (8 → 9) yields a proof the mint rejects after the slot is burned.
-  if (
-    !Number.isSafeInteger(slot.amount) ||
-    slot.amount <= 0 ||
-    Math.log2(slot.amount) % 1 !== 0
-  ) {
-    throw rejection(
-      "amount",
-      // Quoted the way requireHex quotes, so a rejected value never renders as
-      // something that looks valid. JSON.stringify renders NaN and Infinity as
-      // `null` — which is precisely that failure — so those keep their names.
-      `amount must be a positive power of two, got ${
-        Number.isFinite(slot.amount) ? JSON.stringify(slot.amount) : String(slot.amount)
-      }`,
-    )
-  }
+  requireAmount(slot.amount)
 
   return {
     id: keysetId,

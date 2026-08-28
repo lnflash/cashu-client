@@ -8,14 +8,16 @@ import {
   reconstructProofsFromCard,
   serializeCardFile,
 } from "../src"
-import type { CardFile } from "../src"
+import type { CardFile, CardProofSlot } from "../src"
 
 // Real secp256k1 points: reconstructProofFromCard checks curve membership,
 // so placeholder hex would fail there rather than in the parser under test.
 const CARD_PUBKEY = "032994631ef9a4ba5b0db2f44b4d0d8a4b0eec49bed16091c23c171a8c553a03da"
 const REAL_C = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+// On-prefix, off-curve: the shape a prefix-only check waves through.
+const OFF_CURVE = "02" + "ff".repeat(32)
 
-const slot = (over: Record<string, unknown> = {}) => ({
+const slot = (over: Partial<CardProofSlot> = {}): CardProofSlot => ({
   keysetId: "0059534ce0bfa19a",
   amount: 8,
   nonce: "916c21b8c67da71e9d02f4e3adc6f30700c152e01a07ae30e3bcc6b55b0c9e5e",
@@ -23,7 +25,7 @@ const slot = (over: Record<string, unknown> = {}) => ({
   ...over,
 })
 
-const file = (over: Record<string, unknown> = {}) => ({
+const file = (over: Partial<CardFile> = {}): CardFile => ({
   version: CARD_FILE_VERSION,
   mint: "https://forge.flashapp.me",
   unit: "sat",
@@ -31,6 +33,16 @@ const file = (over: Record<string, unknown> = {}) => ({
   slots: [slot()],
   ...over,
 })
+
+// The rejection paths need shapes the types forbid, which is the point of them.
+// Both casts live here so the helpers above stay honestly typed: a signature
+// change to serializeCardFile has to fail this suite, not be absorbed by an
+// `as unknown as` at every call site.
+const invalidSlot = (over: Record<string, unknown>): CardProofSlot =>
+  ({ ...slot(), ...over }) as unknown as CardProofSlot
+
+const invalidFile = (over: Record<string, unknown>): CardFile =>
+  ({ ...file(), ...over }) as unknown as CardFile
 
 describe("parseCardFile", () => {
   it("accepts a well-formed file and normalises hex case", () => {
@@ -56,6 +68,18 @@ describe("parseCardFile", () => {
     expect(cardFileTotal(parsed)).toBe(0)
   })
 
+  // A trailing slash would otherwise survive into the file and fail the
+  // `file.mint === expected` comparison that is the only guard against loading
+  // a card from the wrong mint — silently, since both spellings are the mint.
+  it("canonicalises the mint URL the way every network path does", () => {
+    expect(parseCardFile(file({ mint: "https://forge.flashapp.me/" })).mint).toBe(
+      "https://forge.flashapp.me",
+    )
+    expect(parseCardFile(file({ mint: "https://forge.flashapp.me/cashu/" })).mint).toBe(
+      "https://forge.flashapp.me/cashu",
+    )
+  })
+
   describe("rejects malformed files", () => {
     it("invalid JSON", () => {
       expect(() => parseCardFile("{ not json")).toThrow(/not valid JSON/)
@@ -68,20 +92,45 @@ describe("parseCardFile", () => {
 
     it("a version it does not understand", () => {
       expect(() => parseCardFile(file({ version: 2 }))).toThrow(/unsupported card file version 2/)
-      expect(() => parseCardFile(file({ version: undefined }))).toThrow(/unsupported card file version/)
+      expect(() => parseCardFile(invalidFile({ version: undefined }))).toThrow(
+        /unsupported card file version/,
+      )
     })
 
     it.each(["mint", "unit"])("a missing or empty %s", field => {
-      expect(() => parseCardFile(file({ [field]: "" }))).toThrow(
+      expect(() => parseCardFile(invalidFile({ [field]: "" }))).toThrow(
         new RegExp(`${field} must be a non-empty string`),
       )
-      expect(() => parseCardFile(file({ [field]: undefined }))).toThrow(
+      expect(() => parseCardFile(invalidFile({ [field]: undefined }))).toThrow(
         new RegExp(`${field} must be a non-empty string`),
       )
     })
 
+    // A card file is third-party data off a bearer instrument. The SSRF
+    // controls the HTTP layer applies apply here too, at the boundary, rather
+    // than relying on every consumer to remember to sanitise before dialling.
+    it.each([
+      "http://169.254.169.254/latest/meta-data/",
+      "http://10.0.0.1",
+      "https://user:pass@forge.flashapp.me",
+      "ftp://forge.flashapp.me",
+      "not a url",
+    ])("a mint URL the sanitiser refuses: %s", mint => {
+      expect(() => parseCardFile(file({ mint }))).toThrow(/card file mint:/)
+      expect(() => parseCardFile(file({ mint }))).toThrow(CashuInvalidProofError)
+    })
+
     it("slots that are not an array", () => {
-      expect(() => parseCardFile(file({ slots: {} }))).toThrow(/slots must be an array/)
+      expect(() => parseCardFile(invalidFile({ slots: {} }))).toThrow(/slots must be an array/)
+    })
+
+    // Silently dropping a field a future cardctl added — without bumping
+    // `version` — is exactly the drift `version` exists to catch.
+    it("a field this version does not know about", () => {
+      expect(() => parseCardFile(invalidFile({ counter: 7 }))).toThrow(
+        /unknown field\(s\): counter/,
+      )
+      expect(() => parseCardFile(invalidFile({ counter: 7 }))).toThrow(CashuInvalidProofError)
     })
 
     // The card's key belongs to the card; a slot field belongs to one slot.
@@ -91,6 +140,15 @@ describe("parseCardFile", () => {
         CashuInvalidCardPubkeyError,
       )
       expect(() => parseCardFile(file({ cardPubkey: "02ab" }))).toThrow(/33 bytes/)
+    })
+
+    it("an on-prefix but off-curve card pubkey", () => {
+      expect(() => parseCardFile(file({ cardPubkey: OFF_CURVE }))).toThrow(
+        /cardPubkey is not on the secp256k1 curve/,
+      )
+      expect(() => parseCardFile(file({ cardPubkey: OFF_CURVE }))).toThrow(
+        CashuInvalidCardPubkeyError,
+      )
     })
 
     it("a bad slot, with the slot-level error class and its index", () => {
@@ -111,6 +169,18 @@ describe("parseCardSlot", () => {
     )
   })
 
+  // 8 bytes is the only NUT-02 id version that fits the card's field, so a
+  // first byte other than 00 is a corrupted id that matches no keyset — and
+  // one the mint only rejects after the slot is burned.
+  it("rejects a keyset id that is not NUT-02 v0", () => {
+    expect(() => parseCardSlot(slot({ keysetId: "0159534ce0bfa19a" }), 0)).toThrow(
+      /keysetId must be a NUT-02 v0 id/,
+    )
+    expect(() => parseCardSlot(slot({ keysetId: "0159534ce0bfa19a" }), 0)).toThrow(
+      CashuInvalidProofError,
+    )
+  })
+
   it("names the mistake when a file says secret instead of nonce", () => {
     // The single most likely way for a hand-written or third-party file to be
     // wrong, and the failure it would otherwise produce ("nonce must be a hex
@@ -122,13 +192,42 @@ describe("parseCardSlot", () => {
     expect(() => parseCardSlot({ ...rest, secret: nonce }, 3)).toThrow(/~150 bytes of JSON/)
   })
 
-  it.each([0, -1, 1.5, "8", null])("rejects a bad amount: %p", amount => {
-    expect(() => parseCardSlot(slot({ amount }), 0)).toThrow(/amount must be a positive integer/)
+  it("rejects a slot field this version does not know about", () => {
+    expect(() => parseCardSlot(invalidSlot({ counter: 7 }), 1)).toThrow(
+      /slot 1: unknown field\(s\): counter/,
+    )
+  })
+
+  it.each(["8", null, undefined, {}])("rejects a non-numeric amount: %p", amount => {
+    expect(() => parseCardSlot(invalidSlot({ amount }), 0)).toThrow(/amount must be a number/)
+  })
+
+  // Cashu denominations are powers of two; a mint keyset has no key for 3, so
+  // a corrupted amount byte must not survive to the card.
+  it.each([0, -1, 1.5, 3, 9, 2 ** 60])("rejects a non-denomination amount: %p", amount => {
+    expect(() => parseCardSlot(invalidSlot({ amount }), 0)).toThrow(
+      /amount must be a positive power of two/,
+    )
   })
 
   it("rejects an uncompressed C point", () => {
     expect(() => parseCardSlot(slot({ C: "04" + "cd".repeat(32) }), 0)).toThrow(
       /C must be a compressed/,
+    )
+  })
+
+  // The check this replaced tested the low nibble of the first byte, so it
+  // accepted 32 of the 256 possible prefixes and passed its own test by luck:
+  // 0x04's nibble happens to be 4. These are the prefixes that slipped through.
+  it.each(["12", "f3", "22", "33", "ff"])("rejects the bogus C prefix 0x%s", prefix => {
+    expect(() => parseCardSlot(slot({ C: prefix + "cd".repeat(32) }), 0)).toThrow(
+      new RegExp(`C must be a compressed secp256k1 point, got prefix 0x${prefix}`),
+    )
+  })
+
+  it("rejects an on-prefix but off-curve C", () => {
+    expect(() => parseCardSlot(slot({ C: OFF_CURVE }), 0)).toThrow(
+      /C is not on the secp256k1 curve/,
     )
   })
 
@@ -141,12 +240,12 @@ describe("parseCardSlot", () => {
 describe("serializeCardFile", () => {
   it("round-trips through parse unchanged", () => {
     const original = file()
-    const parsed = parseCardFile(serializeCardFile(original as Omit<CardFile, "version">))
+    const parsed = parseCardFile(serializeCardFile(original))
     expect(parsed).toEqual(parseCardFile(original))
   })
 
   it("stamps the current version so the reader can refuse a future shape", () => {
-    const written = JSON.parse(serializeCardFile(file() as Omit<CardFile, "version">))
+    const written = JSON.parse(serializeCardFile(file()))
     expect(written.version).toBe(CARD_FILE_VERSION)
   })
 
@@ -158,12 +257,62 @@ describe("serializeCardFile", () => {
         unit: "sat",
         cardPubkey: CARD_PUBKEY,
         slots: [slot({ keysetId: "0059534c" })],
-      } as unknown as Omit<CardFile, "version">),
+      }),
     ).toThrow(/keysetId must be 8 bytes/)
   })
 
+  // This is the whole contract of the write direction: cardctl does no curve
+  // math, so anything serializeCardFile accepts is loaded onto a card. A file
+  // the redeem path would reject is money burned at SPEND_PROOF.
+  describe("refuses anything the redeem path would reject", () => {
+    const cases: Array<[string, Record<string, unknown>, RegExp]> = [
+      ["an on-prefix, off-curve C", { C: OFF_CURVE }, /C is not on the secp256k1 curve/],
+      ["a non-v0 keyset id", { keysetId: "0159534ce0bfa19a" }, /keysetId must be a NUT-02 v0 id/],
+      ["a non-power-of-two amount", { amount: 3 }, /amount must be a positive power of two/],
+      ["an unsafe-integer amount", { amount: 2 ** 60 }, /amount must be a positive power of two/],
+    ]
+
+    it.each(cases)("%s", (_name, over, message) => {
+      expect(() => serializeCardFile(file({ slots: [invalidSlot(over)] }))).toThrow(message)
+    })
+
+    it("an off-curve card pubkey", () => {
+      expect(() => serializeCardFile(file({ cardPubkey: OFF_CURVE }))).toThrow(
+        CashuInvalidCardPubkeyError,
+      )
+    })
+
+    // The property behind the cases above: acceptance by the writer implies
+    // acceptance by the reader, for every shape either of them sees.
+    it.each([
+      ["a well-formed card", file()],
+      ["an empty card", file({ slots: [] })],
+      ["several denominations", file({ slots: [slot(), slot({ amount: 16 }), slot({ amount: 1 })] })],
+      ["upper-case hex", file({ cardPubkey: CARD_PUBKEY.toUpperCase() })],
+      ["an unsanitised mint URL", file({ mint: "https://forge.flashapp.me/" })],
+      ["a note", file({ note: "till 2" })],
+      ["a bad C prefix", invalidFile({ slots: [invalidSlot({ C: "12" + "cd".repeat(32) })] })],
+      ["an off-curve C", invalidFile({ slots: [invalidSlot({ C: OFF_CURVE })] })],
+      ["a non-v0 keyset id", invalidFile({ slots: [invalidSlot({ keysetId: "01".repeat(8) })] })],
+      ["amount 3", invalidFile({ slots: [invalidSlot({ amount: 3 })] })],
+      ["a corrupted amount byte", invalidFile({ slots: [invalidSlot({ amount: 9 })] })],
+      ["an unknown slot field", invalidFile({ slots: [invalidSlot({ counter: 7 })] })],
+    ])("what the writer accepts, the reader accepts: %s", (_name, candidate) => {
+      let written: string
+      try {
+        written = serializeCardFile(candidate)
+      } catch {
+        return // Rejected by the writer — nothing reaches the card, which is the point.
+      }
+      const parsed = parseCardFile(written)
+      expect(() =>
+        reconstructProofsFromCard(parsed.slots, parsed.cardPubkey),
+      ).not.toThrow()
+    })
+  })
+
   it("emits compact output when asked", () => {
-    const compact = serializeCardFile(file() as Omit<CardFile, "version">, { pretty: false })
+    const compact = serializeCardFile(file(), { pretty: false })
     expect(compact).not.toContain("\n")
     expect(parseCardFile(compact).slots).toHaveLength(1)
   })
