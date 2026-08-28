@@ -1,4 +1,19 @@
 import type { CardProofSlot } from "./card";
+/**
+ * A slot as it appears in a card file: everything reconstruction needs, plus
+ * the one bit reconstruction does not care about and a redeemer cannot live
+ * without.
+ *
+ * `spent` is not on `CardProofSlot` because rebuilding a proof is identical
+ * either way. It is on the *file* because `LOAD_PROOF` has no spent bit: a
+ * spent proof written back onto a card returns as unspent and inflates the
+ * balance with money that is already gone. See `spec/CARD-FILE.md` in
+ * lnflash/cashu-javacard.
+ */
+export type CardFileSlot = CardProofSlot & {
+    /** Whether the card has already marked this slot spent. */
+    spent: boolean;
+};
 /** Bumped only for a breaking change to the shape below. */
 export declare const CARD_FILE_VERSION = 1;
 export type CardFile = {
@@ -14,7 +29,7 @@ export type CardFile = {
     unit: string;
     /** Compressed secp256k1 pubkey of the card these proofs are locked to. */
     cardPubkey: string;
-    slots: CardProofSlot[];
+    slots: CardFileSlot[];
     /** Free-form; ignored on read. Provenance for a human, never trusted. */
     note?: string;
 };
@@ -25,7 +40,7 @@ export type CardFile = {
  * does — because it runs the same checks — so a caller can tell "this card's
  * key is wrong" from "slot 3 is corrupt" without matching on message text.
  */
-export declare const parseCardSlot: (value: unknown, index: number) => CardProofSlot;
+export declare const parseCardSlot: (value: unknown, index: number) => CardFileSlot;
 /**
  * Parse and validate a card file.
  *

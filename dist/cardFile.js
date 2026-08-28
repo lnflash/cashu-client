@@ -40,11 +40,18 @@ exports.cardFileTotal = exports.serializeCardFile = exports.parseCardFile = expo
  * in a field that holds 32 bytes.
  */
 const card_1 = require("./card");
+/**
+ * The card's `LOAD_PROOF` amount field is a 4-byte unsigned integer, so a
+ * larger amount cannot be written even though it is a valid denomination
+ * elsewhere. Checked at the file boundary because that is the last point
+ * before a card sees it.
+ */
+const MAX_CARD_AMOUNT = 2 ** 32;
 const errors_1 = require("./errors");
 const http_1 = require("./http");
 /** Bumped only for a breaking change to the shape below. */
 exports.CARD_FILE_VERSION = 1;
-const SLOT_FIELDS = ["keysetId", "amount", "nonce", "C"];
+const SLOT_FIELDS = ["keysetId", "amount", "nonce", "C", "spent"];
 const FILE_FIELDS = ["version", "mint", "unit", "cardPubkey", "slots", "note"];
 /**
  * Refuse a field this version does not know about.
@@ -87,11 +94,22 @@ const parseCardSlot = (value, index) => {
     (0, card_1.requireKeysetV0)(keysetId, where);
     const C = (0, card_1.requireHex)(raw.C, 33, "C", where);
     (0, card_1.requirePoint)(C, "C", where);
+    const amount = (0, card_1.requireAmount)(raw.amount, where);
+    if (amount >= MAX_CARD_AMOUNT) {
+        throw new errors_1.CashuInvalidProofError(`${where}amount must be below 2^32 — LOAD_PROOF carries it as a 4-byte ` +
+            `unsigned integer — got ${amount}`);
+    }
+    // Required, never defaulted. Defaulting to false would silently resurrect a
+    // spent proof as spendable on the next load.
+    if (typeof raw.spent !== "boolean") {
+        throw new errors_1.CashuInvalidProofError(`${where}spent must be a boolean, got ${typeof raw.spent}`);
+    }
     return {
         keysetId,
-        amount: (0, card_1.requireAmount)(raw.amount, where),
+        amount,
         nonce: (0, card_1.requireHex)(raw.nonce, 32, "nonce", where),
         C,
+        spent: raw.spent,
     };
 };
 exports.parseCardSlot = parseCardSlot;

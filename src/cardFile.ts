@@ -44,6 +44,30 @@ import {
   requirePoint,
 } from "./card"
 import type { CardProofSlot } from "./card"
+
+/**
+ * A slot as it appears in a card file: everything reconstruction needs, plus
+ * the one bit reconstruction does not care about and a redeemer cannot live
+ * without.
+ *
+ * `spent` is not on `CardProofSlot` because rebuilding a proof is identical
+ * either way. It is on the *file* because `LOAD_PROOF` has no spent bit: a
+ * spent proof written back onto a card returns as unspent and inflates the
+ * balance with money that is already gone. See `spec/CARD-FILE.md` in
+ * lnflash/cashu-javacard.
+ */
+export type CardFileSlot = CardProofSlot & {
+  /** Whether the card has already marked this slot spent. */
+  spent: boolean
+}
+
+/**
+ * The card's `LOAD_PROOF` amount field is a 4-byte unsigned integer, so a
+ * larger amount cannot be written even though it is a valid denomination
+ * elsewhere. Checked at the file boundary because that is the last point
+ * before a card sees it.
+ */
+const MAX_CARD_AMOUNT = 2 ** 32
 import { CashuInvalidProofError } from "./errors"
 import { sanitizeMintUrl } from "./http"
 
@@ -63,12 +87,12 @@ export type CardFile = {
   unit: string
   /** Compressed secp256k1 pubkey of the card these proofs are locked to. */
   cardPubkey: string
-  slots: CardProofSlot[]
+  slots: CardFileSlot[]
   /** Free-form; ignored on read. Provenance for a human, never trusted. */
   note?: string
 }
 
-const SLOT_FIELDS = ["keysetId", "amount", "nonce", "C"]
+const SLOT_FIELDS = ["keysetId", "amount", "nonce", "C", "spent"]
 const FILE_FIELDS = ["version", "mint", "unit", "cardPubkey", "slots", "note"]
 
 /**
@@ -101,7 +125,7 @@ const rejectUnknownFields = (
  * does — because it runs the same checks — so a caller can tell "this card's
  * key is wrong" from "slot 3 is corrupt" without matching on message text.
  */
-export const parseCardSlot = (value: unknown, index: number): CardProofSlot => {
+export const parseCardSlot = (value: unknown, index: number): CardFileSlot => {
   const where = `slot ${index}: `
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new CashuInvalidProofError(`${where}expected an object, got ${typeof value}`)
@@ -125,11 +149,28 @@ export const parseCardSlot = (value: unknown, index: number): CardProofSlot => {
   const C = requireHex(raw.C, 33, "C", where)
   requirePoint(C, "C", where)
 
+  const amount = requireAmount(raw.amount, where)
+  if (amount >= MAX_CARD_AMOUNT) {
+    throw new CashuInvalidProofError(
+      `${where}amount must be below 2^32 — LOAD_PROOF carries it as a 4-byte ` +
+        `unsigned integer — got ${amount}`,
+    )
+  }
+
+  // Required, never defaulted. Defaulting to false would silently resurrect a
+  // spent proof as spendable on the next load.
+  if (typeof raw.spent !== "boolean") {
+    throw new CashuInvalidProofError(
+      `${where}spent must be a boolean, got ${typeof raw.spent}`,
+    )
+  }
+
   return {
     keysetId,
-    amount: requireAmount(raw.amount, where),
+    amount,
     nonce: requireHex(raw.nonce, 32, "nonce", where),
     C,
+    spent: raw.spent,
   }
 }
 
