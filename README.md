@@ -24,6 +24,7 @@ happens here.
 |--------|-------------|
 | `crypto` | NUT-00 `hash_to_curve`, NUT-03 BDHKE blinding/unblinding, NUT-10 P2PK secret serialization, denomination splitting |
 | `card` | Reconstructing a spendable proof from a card's 78-byte slot layout — NUT-10 P2PK secret recovery |
+| `cardFile` | The interchange format between this library and the Python card driver — one schema both sides validate against |
 | `mint` | Nutshell HTTP client — NUT-01 keysets, NUT-04 mint quotes + proof issuance |
 | `witness` | NUT-11 P2PK witnesses — the message a card must sign, attaching its signature, verifying the result |
 | `melt` | NUT-05 melting — quote, execute, and proof selection. **This is how a card gets redeemed.** |
@@ -42,10 +43,111 @@ covered:
 
 | Stage | Calls |
 |---|---|
-| **Load** a card | `requestMintQuote` → pay → `mintProofs` → `unblindSignature` + `proofDLEQFromBlindSignature` |
+| **Load** a card | `requestMintQuote` → pay → `mintProofs` → `unblindSignature` + `proofDLEQFromBlindSignature` → `serializeCardFile` → cardctl `LOAD_PROOF` |
 | **Verify** what's on it | `verifyProofDLEQ` (offline) or `checkProofStates` (online) |
-| **Spend** at a terminal | `GET_PROOF` → `reconstructProofsFromCard` → `requestMeltQuote` → `selectProofsForMelt` → card signs `p2pkMessageToSign` → `attachP2PKWitness` → `meltProofs` |
+| **Spend** at a terminal | `GET_PROOF` → `parseCardFile` → `reconstructProofsFromCard` → `requestMeltQuote` → `selectProofsForMelt` → card signs `p2pkMessageToSign` → `attachP2PKWitness` → `meltProofs` |
 | **Make change** | `swapProofs` |
+
+#### Crossing to the card: the card file
+
+The card driver ([`tools/cardctl`](https://github.com/lnflash/cashu-javacard))
+is dependency-free Python so it runs anywhere a reader does; this library is
+TypeScript. Neither can call the other, so proofs cross as a file — and the
+schema for it lives here, in `cardFile`, rather than in either CLI. Both sides
+validate against the same definition, so a field that drifts fails at the
+boundary instead of at the mint, where the card may already have burned the
+slot on `SPEND_PROOF`.
+
+```jsonc
+{
+  "version": 1,
+  "mint": "https://forge.flashapp.me",
+  "unit": "sat",
+  "cardPubkey": "032994631ef9a4ba5b0db2f44b4d0d8a4b0eec49bed16091c23c171a8c553a03da",
+  "slots": [
+    {
+      "keysetId": "0059534ce0bfa19a",
+      "amount": 8,
+      "nonce": "916c21b8c67da71e9d02f4e3adc6f30700c152e01a07ae30e3bcc6b55b0c9e5e",
+      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "spent": false
+    }
+  ],
+  "note": "loaded at till 2"
+}
+```
+
+```typescript
+import {
+  serializeCardFile,
+  parseCardFile,
+  cardFileTotal,
+  reconstructProofsFromCard,
+  sanitizeMintUrl,
+} from "@lnflash/cashu-client"
+
+// mint → card: hand this to cardctl to load. `blindingData` is what
+// createBlindedMessage returned — it carries the 32-byte nonce the card
+// stores, which is not recoverable from anything else in the proof.
+const json = serializeCardFile({
+  mint: MINT_URL,
+  unit: "sat",
+  cardPubkey,
+  slots: proofs.map((p, i) => ({
+    keysetId: p.id,
+    amount: p.amount,
+    nonce: blindingData[i].nonce, // the 32-byte nonce, not the ~150-byte secret
+    C: p.C,
+    spent: false, // required; the writer refuses a true
+  })),
+  note: "loaded at till 2",
+})
+
+// card → mint: what cardctl dumped, ready to spend. Compare against the
+// *sanitised* URL — `card.mint` comes back canonical, and a raw constant with
+// a trailing slash would reject a card from the right mint.
+const card = parseCardFile(await fs.readFile("card.json", "utf8"))
+if (card.mint !== sanitizeMintUrl(MINT_URL)) throw new Error("card is from a different mint")
+const unspent = card.slots.filter(s => !s.spent)
+const spendable = reconstructProofsFromCard(unspent, card.cardPubkey)
+console.log(`${cardFileTotal(card)} ${card.unit} across ${unspent.length} slots`)
+```
+
+**The wire shape is the card's vocabulary, not `CashuProof`'s.** `nonce`, not
+`secret`, and `keysetId` as 16 hex chars — because that is what the card
+actually stores. A file that said `secret` would invite ~150 bytes of P2PK JSON
+into a field that holds 32 bytes, so that spelling is rejected by name.
+
+**`serializeCardFile` is the only gate in the mint → card direction.** cardctl
+does no curve math, so whatever this writes reaches the card. It therefore
+round-trips the file through `parseCardFile` *and* through the redeem path
+(`reconstructProofsFromCard`, result discarded) before returning: what it
+writes is, by construction, what the spend path reads back. An on-prefix but
+off-curve `C` would otherwise load fine, burn the slot on `SPEND_PROOF`, and be
+rejected by the mint as a proof that was never spendable.
+
+**Both directions refuse rather than repair.** Unknown fields (bump `version`
+instead of adding one silently), a `note` that is not a string or is over 512
+characters, a non-v0 or half-length `keysetId`, an amount that is not a positive
+power of two or is `2^32` or larger (`LOAD_PROOF` carries it as four bytes), a
+missing or non-boolean `spent`, a mint URL the HTTP sanitiser refuses, and — the
+shapes every per-slot check otherwise waves through — **the same `C` in two
+slots** or **the same `nonce` in two slots**. Either way both copies load; the
+first redeems, the second burns on `SPEND_PROOF` and comes back already-spent,
+while `cardFileTotal` told the holder the card was worth double. `C` repeats are
+the same signature twice; `nonce` repeats are subtler, since the secret is
+derived from the nonce and the card key alone, so two slots with one nonce
+reconstruct to one proof even when their amounts and `C` values differ.
+`mint` and `unit` come back canonicalised, so the comparison above is not
+defeated by a trailing slash — on either side, which is why `MINT_URL` goes
+through `sanitizeMintUrl` too.
+
+**`spent` travels card → mint only.** `parseCardFile` keeps it because a card
+dump is where it comes from; `serializeCardFile` refuses a `spent: true` slot,
+because `LOAD_PROOF` has no spent bit and a spent proof written back onto a card
+returns as spendable. Filter them out before serializing — topping up an
+existing card is dump, drop the spent slots, append, write. `cardFileTotal`
+counts only the unspent slots, for the same reason.
 
 Five things worth knowing before wiring this up.
 
@@ -95,7 +197,7 @@ as "safe to accept" — the inverse of the double-spend check's purpose.
 
 ```bash
 # yarn v1 (git dep, no npm publish needed)
-yarn add github:lnflash/cashu-client#v0.4.0
+yarn add github:lnflash/cashu-client#v0.5.0
 
 # or via npm
 npm install @lnflash/cashu-client

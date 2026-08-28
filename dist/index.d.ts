@@ -7,5 +7,7 @@ export * from "./melt";
 export * from "./swap";
 export * from "./state";
 export * from "./dleq";
-export * from "./card";
+export { reconstructProofFromCard, reconstructProofsFromCard, } from "./card";
+export type { CardProofSlot, CardReconstructionResult, CardSlotFailure, ReconstructCardBatchOptions, ReconstructCardOptions, } from "./card";
+export * from "./cardFile";
 export { sanitizeMintUrl } from "./http";

@@ -16,6 +16,62 @@ export type CardProofSlot = {
     /** The mint's unblinded signature at offset 45 — 33 bytes, 66 hex chars. */
     C: string;
 };
+/**
+ * Every field this module validates.
+ *
+ * Exported because `cardFile.ts` validates these same fields on the way in from
+ * a file and reuses the checks below rather than restating them.
+ */
+export type CardField = "cardPubkey" | "keysetId" | "nonce" | "C" | "amount";
+/**
+ * Lower-cased, length-checked hex, or the field's own rejection class.
+ *
+ * `where` prefixes the message with the caller's context (`"slot 3: "`), which
+ * is what lets `cardFile.ts` reuse this verbatim instead of keeping a second
+ * copy that drifts. Empty by default, so the messages this module produces are
+ * unchanged and the batch path keeps adding its own `slot <i>: ` prefix.
+ *
+ * `value` is `unknown` rather than `string` on purpose: the typeof check below
+ * is the whole reason a caller reaches for this, and typing the parameter as
+ * `string` would push every caller holding parsed-JSON data into a cast.
+ */
+export declare const requireHex: (value: unknown, bytes: number, field: CardField, where?: string) => string;
+/**
+ * Reject anything that is not an actual point on secp256k1.
+ *
+ * A prefix test is not enough: `02`/`03` is necessary but not sufficient, and an
+ * on-prefix but off-curve value produces a secret locked to a non-point — the
+ * card burns the slot on SPEND_PROOF and the mint then rejects a proof that was
+ * never spendable. `secp.isPoint` is how the rest of this package validates
+ * points (crypto.ts, dleq.ts, witness.ts), and the 33-byte length check in
+ * `requireHex` has already rejected uncompressed keys by the time we get here.
+ *
+ * The two failures are reported separately because they send an operator to
+ * different places. A bad prefix is a reader that encoded the point wrong. An
+ * on-prefix, off-curve value is a corrupted or truncated point, and quoting
+ * only its (valid) prefix byte would point at the one part that is *not* the
+ * problem — the misdiagnosis this module exists to eliminate.
+ */
+export declare const requirePoint: (value: string, field: CardField, where?: string) => void;
+/**
+ * A NUT-02 v0 id is a 0x00 version byte plus 7 bytes of hash, and 8 bytes is
+ * the only id version that fits the card's field — so a first byte other than
+ * 00 is a corrupted id, which matches no keyset just like a truncated one.
+ *
+ * Split out of {@link reconstructProofFromCard} so the file parser applies the
+ * same rule; the caller has already run the value through {@link requireHex}.
+ */
+export declare const requireKeysetV0: (keysetId: string, where?: string) => void;
+/**
+ * A Cashu denomination: a positive power of two, safely representable.
+ *
+ * `splitIntoDenominations` never emits anything else and a mint keyset has no
+ * key for amount 3, so a corrupted amount byte (8 → 9) yields a proof the mint
+ * rejects after the slot is burned. Shared with the file parser for exactly
+ * that reason — a file is written before anything is loaded onto a card, which
+ * is the last place the bad amount can be caught for free.
+ */
+export declare const requireAmount: (value: unknown, where?: string) => number;
 /** Options shared by the single-slot and batch reconstruction paths. */
 export type ReconstructCardOptions = {
     /**

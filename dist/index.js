@@ -14,7 +14,7 @@ var __exportStar = (this && this.__exportStar) || function(m, exports) {
     for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.sanitizeMintUrl = void 0;
+exports.sanitizeMintUrl = exports.reconstructProofsFromCard = exports.reconstructProofFromCard = void 0;
 __exportStar(require("./types"), exports);
 __exportStar(require("./errors"), exports);
 __exportStar(require("./crypto"), exports);
@@ -24,6 +24,15 @@ __exportStar(require("./melt"), exports);
 __exportStar(require("./swap"), exports);
 __exportStar(require("./state"), exports);
 __exportStar(require("./dleq"), exports);
-__exportStar(require("./card"), exports);
+// Named rather than `export *`. `card.ts` exports `requireHex`, `requirePoint`,
+// `requireKeysetV0`, `requireAmount` and `CardField` so `cardFile.ts` can reuse
+// the checks instead of keeping a second copy that drifts — an internal reuse,
+// not a promise to consumers. Re-exporting them wholesale would make four
+// validators whose signatures carry an internal `where` prefix parameter part
+// of the package's semver surface. Same reasoning as `sanitizeMintUrl` below.
+var card_1 = require("./card");
+Object.defineProperty(exports, "reconstructProofFromCard", { enumerable: true, get: function () { return card_1.reconstructProofFromCard; } });
+Object.defineProperty(exports, "reconstructProofsFromCard", { enumerable: true, get: function () { return card_1.reconstructProofsFromCard; } });
+__exportStar(require("./cardFile"), exports);
 var http_1 = require("./http");
 Object.defineProperty(exports, "sanitizeMintUrl", { enumerable: true, get: function () { return http_1.sanitizeMintUrl; } });
