@@ -137,6 +137,22 @@ const parseCardFile = (input) => {
     catch (error) {
         throw new errors_1.CashuInvalidProofError(`card file mint: ${error.message}`);
     }
+    // `unit` gets the same treatment, because it has the same job. A caller's
+    // only use for it is `file.unit === keyset.unit`, and a mint declares its
+    // keyset units trimmed and lower case — so `"SAT "` stored verbatim makes
+    // that comparison return false against a keyset that is in fact the right
+    // one, silently, exactly the way an untrimmed mint URL did.
+    const unit = raw.unit.trim().toLowerCase();
+    if (unit === "") {
+        throw new errors_1.CashuInvalidProofError("card file unit must be a non-empty string");
+    }
+    // A known field with the wrong type is checked, not dropped. Discarding it
+    // silently is the drift `rejectUnknownFields` refuses two fields up — and
+    // `note` is the file's only provenance record, so losing it without a word
+    // is how "loaded at till 2" becomes an unattributable card.
+    if (raw.note !== undefined && typeof raw.note !== "string") {
+        throw new errors_1.CashuInvalidProofError("card file note must be a string when present");
+    }
     if (!Array.isArray(raw.slots)) {
         throw new errors_1.CashuInvalidProofError("card file slots must be an array");
     }
@@ -145,13 +161,33 @@ const parseCardFile = (input) => {
     // corrupt". Same ordering, and the same reason, as reconstructProofFromCard.
     const cardPubkey = (0, card_1.requireHex)(raw.cardPubkey, 33, "cardPubkey", "card file ");
     (0, card_1.requirePoint)(cardPubkey, "cardPubkey", "card file ");
+    const slots = raw.slots.map(exports.parseCardSlot);
+    // The same proof twice. Every per-slot check passes — both copies are
+    // well-formed, on-curve and reconstruct fine — which makes this the one
+    // malformed file the writer would otherwise hand to a card, and the failure
+    // it produces is the one this format exists to prevent: slot 0 burns and
+    // redeems, slot 1 burns on SPEND_PROOF and the mint refuses it as already
+    // spent, while `cardFileTotal` told the holder the card was worth double.
+    //
+    // `C` is the mint's unblinded signature over a per-proof secret, so it is
+    // unique per proof and a repeat is never a coincidence. Checked here rather
+    // than in `serializeCardFile` so a card *dumped* with a duplicated slot is
+    // caught on the read direction too, before anything is redeemed.
+    const seen = new Set();
+    slots.forEach((s, i) => {
+        if (seen.has(s.C)) {
+            throw new errors_1.CashuInvalidProofError(`slot ${i}: duplicates an earlier slot's C — the same proof twice burns a ` +
+                `slot the mint will reject as already spent`);
+        }
+        seen.add(s.C);
+    });
     return {
         version: exports.CARD_FILE_VERSION,
         mint,
-        unit: raw.unit,
+        unit,
         cardPubkey,
-        slots: raw.slots.map(exports.parseCardSlot),
-        ...(typeof raw.note === "string" ? { note: raw.note } : {}),
+        slots,
+        ...(raw.note !== undefined ? { note: raw.note } : {}),
     };
 };
 exports.parseCardFile = parseCardFile;

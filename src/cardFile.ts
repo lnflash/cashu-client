@@ -54,7 +54,12 @@ export type CardFile = {
   version: number
   /** Mint the proofs belong to. Loading a card from the wrong mint is silent. */
   mint: string
-  /** Keyset unit, e.g. `sat` or `usd`. Carried so amounts are unambiguous. */
+  /**
+   * Keyset unit, e.g. `sat` or `usd`. Carried so amounts are unambiguous.
+   *
+   * Canonicalised on read — trimmed and lower-cased — for the same reason
+   * `mint` is: its only use is a `file.unit === keyset.unit` comparison.
+   */
   unit: string
   /** Compressed secp256k1 pubkey of the card these proofs are locked to. */
   cardPubkey: string
@@ -173,6 +178,22 @@ export const parseCardFile = (input: string | unknown): CardFile => {
   } catch (error) {
     throw new CashuInvalidProofError(`card file mint: ${(error as Error).message}`)
   }
+  // `unit` gets the same treatment, because it has the same job. A caller's
+  // only use for it is `file.unit === keyset.unit`, and a mint declares its
+  // keyset units trimmed and lower case — so `"SAT "` stored verbatim makes
+  // that comparison return false against a keyset that is in fact the right
+  // one, silently, exactly the way an untrimmed mint URL did.
+  const unit = (raw.unit as string).trim().toLowerCase()
+  if (unit === "") {
+    throw new CashuInvalidProofError("card file unit must be a non-empty string")
+  }
+  // A known field with the wrong type is checked, not dropped. Discarding it
+  // silently is the drift `rejectUnknownFields` refuses two fields up — and
+  // `note` is the file's only provenance record, so losing it without a word
+  // is how "loaded at till 2" becomes an unattributable card.
+  if (raw.note !== undefined && typeof raw.note !== "string") {
+    throw new CashuInvalidProofError("card file note must be a string when present")
+  }
   if (!Array.isArray(raw.slots)) {
     throw new CashuInvalidProofError("card file slots must be an array")
   }
@@ -183,13 +204,37 @@ export const parseCardFile = (input: string | unknown): CardFile => {
   const cardPubkey = requireHex(raw.cardPubkey, 33, "cardPubkey", "card file ")
   requirePoint(cardPubkey, "cardPubkey", "card file ")
 
+  const slots = (raw.slots as unknown[]).map(parseCardSlot)
+
+  // The same proof twice. Every per-slot check passes — both copies are
+  // well-formed, on-curve and reconstruct fine — which makes this the one
+  // malformed file the writer would otherwise hand to a card, and the failure
+  // it produces is the one this format exists to prevent: slot 0 burns and
+  // redeems, slot 1 burns on SPEND_PROOF and the mint refuses it as already
+  // spent, while `cardFileTotal` told the holder the card was worth double.
+  //
+  // `C` is the mint's unblinded signature over a per-proof secret, so it is
+  // unique per proof and a repeat is never a coincidence. Checked here rather
+  // than in `serializeCardFile` so a card *dumped* with a duplicated slot is
+  // caught on the read direction too, before anything is redeemed.
+  const seen = new Set<string>()
+  slots.forEach((s, i) => {
+    if (seen.has(s.C)) {
+      throw new CashuInvalidProofError(
+        `slot ${i}: duplicates an earlier slot's C — the same proof twice burns a ` +
+          `slot the mint will reject as already spent`,
+      )
+    }
+    seen.add(s.C)
+  })
+
   return {
     version: CARD_FILE_VERSION,
     mint,
-    unit: raw.unit as string,
+    unit,
     cardPubkey,
-    slots: (raw.slots as unknown[]).map(parseCardSlot),
-    ...(typeof raw.note === "string" ? { note: raw.note } : {}),
+    slots,
+    ...(raw.note !== undefined ? { note: raw.note as string } : {}),
   }
 }
 

@@ -14,6 +14,11 @@ import type { CardFile, CardProofSlot } from "../src"
 // so placeholder hex would fail there rather than in the parser under test.
 const CARD_PUBKEY = "032994631ef9a4ba5b0db2f44b4d0d8a4b0eec49bed16091c23c171a8c553a03da"
 const REAL_C = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+// Further on-curve signatures. Two slots on one card are two different proofs,
+// so multi-slot fixtures must carry different `C` values — a card whose slots
+// share one is the duplicate-proof file parseCardFile now refuses.
+const REAL_C2 = "02fe8d1eb1bcb3432b1db5833ff5f2226d9cb5e65cee430558c18ed3a3c86ce1af"
+const REAL_C3 = "03d528ecd9b696b54c907a9ed045447a79bb408ec39b68df504bb51f459bc3ffc9"
 // On-prefix, off-curve: the shape a prefix-only check waves through.
 const OFF_CURVE = "02" + "ff".repeat(32)
 
@@ -78,6 +83,18 @@ describe("parseCardFile", () => {
     expect(parseCardFile(file({ mint: "https://forge.flashapp.me/cashu/" })).mint).toBe(
       "https://forge.flashapp.me/cashu",
     )
+  })
+
+  // `unit` has the same job and therefore the same failure: the only thing a
+  // caller does with it is compare it against a keyset's unit, and a mint
+  // declares those trimmed and lower case.
+  it.each([
+    ["SAT", "sat"],
+    ["sat ", "sat"],
+    [" Sat\t", "sat"],
+    ["USD", "usd"],
+  ])("canonicalises the unit %p to %p", (raw, expected) => {
+    expect(parseCardFile(file({ unit: raw })).unit).toBe(expected)
   })
 
   describe("rejects malformed files", () => {
@@ -157,6 +174,53 @@ describe("parseCardFile", () => {
       )
       expect(() => parseCardFile(file({ slots: [slot(), slot({ nonce: "ab" })] }))).toThrow(
         /slot 1: nonce must be 32 bytes/,
+      )
+    })
+
+    // The one shape where every per-slot check passes and the card still
+    // burns a slot the mint refuses: slot 0 redeems, slot 1 burns on
+    // SPEND_PROOF and comes back already-spent, while cardFileTotal claimed
+    // both were spendable.
+    it("the same proof twice", () => {
+      expect(() => parseCardFile(file({ slots: [slot(), slot()] }))).toThrow(
+        /slot 1: duplicates an earlier slot's C/,
+      )
+      expect(() => parseCardFile(file({ slots: [slot(), slot()] }))).toThrow(
+        CashuInvalidProofError,
+      )
+    })
+
+    // Differing amount or nonce is not a different proof: `C` is the mint's
+    // signature over one secret, so a repeat is the same proof relabelled.
+    it("a duplicate C even when the other slot fields differ", () => {
+      expect(() =>
+        parseCardFile(
+          file({
+            slots: [slot(), slot({ amount: 16, nonce: "cd".repeat(32) })],
+          }),
+        ),
+      ).toThrow(/slot 1: duplicates an earlier slot's C/)
+    })
+
+    it("a duplicate that is not adjacent, naming the later index", () => {
+      expect(() =>
+        parseCardFile(file({ slots: [slot(), slot({ C: REAL_C2 }), slot({ C: REAL_C })] })),
+      ).toThrow(/slot 2: duplicates an earlier slot's C/)
+    })
+
+    it("a note that is not a string", () => {
+      expect(() => parseCardFile(invalidFile({ note: 42 }))).toThrow(
+        /note must be a string when present/,
+      )
+      expect(() => parseCardFile(invalidFile({ note: 42 }))).toThrow(CashuInvalidProofError)
+      expect(() => parseCardFile(invalidFile({ note: { at: "till 2" } }))).toThrow(
+        /note must be a string when present/,
+      )
+    })
+
+    it("a unit that is only whitespace", () => {
+      expect(() => parseCardFile(file({ unit: "   " }))).toThrow(
+        /unit must be a non-empty string/,
       )
     })
   })
@@ -284,30 +348,80 @@ describe("serializeCardFile", () => {
 
     // The property behind the cases above: acceptance by the writer implies
     // acceptance by the reader, for every shape either of them sees.
-    it.each([
-      ["a well-formed card", file()],
-      ["an empty card", file({ slots: [] })],
-      ["several denominations", file({ slots: [slot(), slot({ amount: 16 }), slot({ amount: 1 })] })],
-      ["upper-case hex", file({ cardPubkey: CARD_PUBKEY.toUpperCase() })],
-      ["an unsanitised mint URL", file({ mint: "https://forge.flashapp.me/" })],
-      ["a note", file({ note: "till 2" })],
-      ["a bad C prefix", invalidFile({ slots: [invalidSlot({ C: "12" + "cd".repeat(32) })] })],
-      ["an off-curve C", invalidFile({ slots: [invalidSlot({ C: OFF_CURVE })] })],
-      ["a non-v0 keyset id", invalidFile({ slots: [invalidSlot({ keysetId: "01".repeat(8) })] })],
-      ["amount 3", invalidFile({ slots: [invalidSlot({ amount: 3 })] })],
-      ["a corrupted amount byte", invalidFile({ slots: [invalidSlot({ amount: 9 })] })],
-      ["an unknown slot field", invalidFile({ slots: [invalidSlot({ counter: 7 })] })],
-    ])("what the writer accepts, the reader accepts: %s", (_name, candidate) => {
-      let written: string
-      try {
-        written = serializeCardFile(candidate)
-      } catch {
-        return // Rejected by the writer — nothing reaches the card, which is the point.
-      }
-      const parsed = parseCardFile(written)
-      expect(() =>
-        reconstructProofsFromCard(parsed.slots, parsed.cardPubkey),
-      ).not.toThrow()
+    //
+    // Split into accept rows and reject rows deliberately. A single table with
+    // a `catch { return }` makes the accept rows unfalsifiable — the row named
+    // "what the writer accepts, the reader accepts" would pass on a writer that
+    // threw on a well-formed card, asserting nothing about the half of the
+    // property it is named for. Each half now asserts its own direction.
+    describe("what the writer accepts, the reader accepts", () => {
+      it.each([
+        ["a well-formed card", file()],
+        ["an empty card", file({ slots: [] })],
+        [
+          "several denominations",
+          file({
+            slots: [slot(), slot({ amount: 16, C: REAL_C2 }), slot({ amount: 1, C: REAL_C3 })],
+          }),
+        ],
+        ["upper-case hex", file({ cardPubkey: CARD_PUBKEY.toUpperCase() })],
+        ["an unsanitised mint URL", file({ mint: "https://forge.flashapp.me/" })],
+        ["an uncanonical unit", file({ unit: "SAT " })],
+        ["a note", file({ note: "till 2" })],
+      ])("%s", (_name, candidate) => {
+        expect(() => serializeCardFile(candidate)).not.toThrow()
+        const parsed = parseCardFile(serializeCardFile(candidate))
+        expect(() => reconstructProofsFromCard(parsed.slots, parsed.cardPubkey)).not.toThrow()
+      })
+    })
+
+    // The other half: what the reader would reject never gets written, so it
+    // never reaches a card. These assert the throw rather than tolerating it.
+    describe("what the reader would reject, the writer refuses to write", () => {
+      it.each([
+        [
+          "a bad C prefix",
+          invalidFile({ slots: [invalidSlot({ C: "12" + "cd".repeat(32) })] }),
+          /C must be a compressed secp256k1 point/,
+        ],
+        [
+          "an off-curve C",
+          invalidFile({ slots: [invalidSlot({ C: OFF_CURVE })] }),
+          /C is not on the secp256k1 curve/,
+        ],
+        [
+          "a non-v0 keyset id",
+          invalidFile({ slots: [invalidSlot({ keysetId: "01".repeat(8) })] }),
+          /keysetId must be a NUT-02 v0 id/,
+        ],
+        [
+          "amount 3",
+          invalidFile({ slots: [invalidSlot({ amount: 3 })] }),
+          /amount must be a positive power of two/,
+        ],
+        [
+          "a corrupted amount byte",
+          invalidFile({ slots: [invalidSlot({ amount: 9 })] }),
+          /amount must be a positive power of two/,
+        ],
+        [
+          "an unknown slot field",
+          invalidFile({ slots: [invalidSlot({ counter: 7 })] }),
+          /unknown field\(s\): counter/,
+        ],
+        [
+          "the same proof in two slots",
+          file({ slots: [slot(), slot()] }),
+          /slot 1: duplicates an earlier slot's C/,
+        ],
+        [
+          "a note that is not a string",
+          invalidFile({ note: 42 }),
+          /note must be a string when present/,
+        ],
+      ])("%s", (_name, candidate, message) => {
+        expect(() => serializeCardFile(candidate)).toThrow(message)
+      })
     })
   })
 
@@ -323,7 +437,7 @@ describe("the card → mint direction", () => {
     // This is the whole point of the format: what cardctl dumps is what the
     // mint side reconstructs, with no field renaming in between.
     const parsed = parseCardFile(
-      file({ slots: [slot(), slot({ amount: 16, nonce: "cd".repeat(32) })] }),
+      file({ slots: [slot(), slot({ amount: 16, nonce: "cd".repeat(32), C: REAL_C2 })] }),
     )
     const proofs = reconstructProofsFromCard(parsed.slots, parsed.cardPubkey)
 

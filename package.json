@@ -1,6 +1,6 @@
 {
   "name": "@lnflash/cashu-client",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Cashu NFC card client — BDHKE crypto, NUT-11 P2PK witnesses, and the full mint/melt/swap spend path",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

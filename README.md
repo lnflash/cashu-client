@@ -24,6 +24,7 @@ happens here.
 |--------|-------------|
 | `crypto` | NUT-00 `hash_to_curve`, NUT-03 BDHKE blinding/unblinding, NUT-10 P2PK secret serialization, denomination splitting |
 | `card` | Reconstructing a spendable proof from a card's 78-byte slot layout — NUT-10 P2PK secret recovery |
+| `cardFile` | The interchange format between this library and the Python card driver — one schema both sides validate against |
 | `mint` | Nutshell HTTP client — NUT-01 keysets, NUT-04 mint quotes + proof issuance |
 | `witness` | NUT-11 P2PK witnesses — the message a card must sign, attaching its signature, verifying the result |
 | `melt` | NUT-05 melting — quote, execute, and proof selection. **This is how a card gets redeemed.** |
@@ -42,10 +43,92 @@ covered:
 
 | Stage | Calls |
 |---|---|
-| **Load** a card | `requestMintQuote` → pay → `mintProofs` → `unblindSignature` + `proofDLEQFromBlindSignature` |
+| **Load** a card | `requestMintQuote` → pay → `mintProofs` → `unblindSignature` + `proofDLEQFromBlindSignature` → `serializeCardFile` → cardctl `LOAD_PROOF` |
 | **Verify** what's on it | `verifyProofDLEQ` (offline) or `checkProofStates` (online) |
-| **Spend** at a terminal | `GET_PROOF` → `reconstructProofsFromCard` → `requestMeltQuote` → `selectProofsForMelt` → card signs `p2pkMessageToSign` → `attachP2PKWitness` → `meltProofs` |
+| **Spend** at a terminal | `GET_PROOF` → `parseCardFile` → `reconstructProofsFromCard` → `requestMeltQuote` → `selectProofsForMelt` → card signs `p2pkMessageToSign` → `attachP2PKWitness` → `meltProofs` |
 | **Make change** | `swapProofs` |
+
+#### Crossing to the card: the card file
+
+The card driver ([`tools/cardctl`](https://github.com/lnflash/cashu-javacard))
+is dependency-free Python so it runs anywhere a reader does; this library is
+TypeScript. Neither can call the other, so proofs cross as a file — and the
+schema for it lives here, in `cardFile`, rather than in either CLI. Both sides
+validate against the same definition, so a field that drifts fails at the
+boundary instead of at the mint, where the card may already have burned the
+slot on `SPEND_PROOF`.
+
+```jsonc
+{
+  "version": 1,
+  "mint": "https://forge.flashapp.me",
+  "unit": "sat",
+  "cardPubkey": "032994631ef9a4ba5b0db2f44b4d0d8a4b0eec49bed16091c23c171a8c553a03da",
+  "slots": [
+    {
+      "keysetId": "0059534ce0bfa19a",
+      "amount": 8,
+      "nonce": "916c21b8c67da71e9d02f4e3adc6f30700c152e01a07ae30e3bcc6b55b0c9e5e",
+      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+    }
+  ],
+  "note": "loaded at till 2"
+}
+```
+
+```typescript
+import {
+  serializeCardFile,
+  parseCardFile,
+  cardFileTotal,
+  reconstructProofsFromCard,
+} from "@lnflash/cashu-client"
+
+// mint → card: hand this to cardctl to load. `blindingData` is what
+// createBlindedMessage returned — it carries the 32-byte nonce the card
+// stores, which is not recoverable from anything else in the proof.
+const json = serializeCardFile({
+  mint: MINT_URL,
+  unit: "sat",
+  cardPubkey,
+  slots: proofs.map((p, i) => ({
+    keysetId: p.id,
+    amount: p.amount,
+    nonce: blindingData[i].nonce, // the 32-byte nonce, not the ~150-byte secret
+    C: p.C,
+  })),
+  note: "loaded at till 2",
+})
+
+// card → mint: what cardctl dumped, ready to spend.
+const card = parseCardFile(await fs.readFile("card.json", "utf8"))
+if (card.mint !== MINT_URL) throw new Error("card is from a different mint")
+const spendable = reconstructProofsFromCard(card.slots, card.cardPubkey)
+console.log(`${cardFileTotal(card)} ${card.unit} across ${card.slots.length} slots`)
+```
+
+**The wire shape is the card's vocabulary, not `CashuProof`'s.** `nonce`, not
+`secret`, and `keysetId` as 16 hex chars — because that is what the card
+actually stores. A file that said `secret` would invite ~150 bytes of P2PK JSON
+into a field that holds 32 bytes, so that spelling is rejected by name.
+
+**`serializeCardFile` is the only gate in the mint → card direction.** cardctl
+does no curve math, so whatever this writes reaches the card. It therefore
+round-trips the file through `parseCardFile` *and* through the redeem path
+(`reconstructProofsFromCard`, result discarded) before returning: what it
+writes is, by construction, what the spend path reads back. An on-prefix but
+off-curve `C` would otherwise load fine, burn the slot on `SPEND_PROOF`, and be
+rejected by the mint as a proof that was never spendable.
+
+**Both directions refuse rather than repair.** Unknown fields (bump `version`
+instead of adding one silently), a `note` that is not a string, a non-v0 or
+half-length `keysetId`, an amount that is not a positive power of two, a mint
+URL the HTTP sanitiser refuses, and — the one shape every per-slot check
+otherwise waves through — **the same `C` in two slots**. Duplicate slots both
+load; the first redeems, the second burns on `SPEND_PROOF` and comes back
+already-spent, while `cardFileTotal` told the holder the card was worth double.
+`mint` and `unit` come back canonicalised, so the `card.mint !== MINT_URL`
+comparison above is not defeated by a trailing slash.
 
 Five things worth knowing before wiring this up.
 
@@ -95,7 +178,7 @@ as "safe to accept" — the inverse of the double-spend check's purpose.
 
 ```bash
 # yarn v1 (git dep, no npm publish needed)
-yarn add github:lnflash/cashu-client#v0.4.0
+yarn add github:lnflash/cashu-client#v0.5.0
 
 # or via npm
 npm install @lnflash/cashu-client

@@ -5,7 +5,12 @@ export type CardFile = {
     version: number;
     /** Mint the proofs belong to. Loading a card from the wrong mint is silent. */
     mint: string;
-    /** Keyset unit, e.g. `sat` or `usd`. Carried so amounts are unambiguous. */
+    /**
+     * Keyset unit, e.g. `sat` or `usd`. Carried so amounts are unambiguous.
+     *
+     * Canonicalised on read — trimmed and lower-cased — for the same reason
+     * `mint` is: its only use is a `file.unit === keyset.unit` comparison.
+     */
     unit: string;
     /** Compressed secp256k1 pubkey of the card these proofs are locked to. */
     cardPubkey: string;
