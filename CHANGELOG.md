@@ -20,12 +20,13 @@
     "slots": [
       {
         "keysetId": "0059534ce0bfa19a",   // NUT-02 v0, 8 bytes
-        "amount": 8,                      // positive power of two
-        "nonce": "916c…",                 // 32 bytes — NOT the secret
-        "C": "02c6…"                      // 33 bytes, on-curve, unique per slot
+        "amount": 8,                      // positive power of two, below 2^32
+        "nonce": "916c…",                 // 32 bytes — NOT the secret; unique per slot
+        "C": "02c6…",                     // 33 bytes, on-curve, unique per slot
+        "spent": false                    // required; card → mint only
       }
     ],
-    "note": "loaded at till 2"            // optional, never trusted structurally
+    "note": "loaded at till 2"            // optional, ≤ 512 chars, never trusted
   }
   ```
 
@@ -35,7 +36,8 @@
     through `parseCardFile` and then through the redeem path
     (`reconstructProofsFromCard`, result discarded) before writing. This is the
     only gate in that direction: cardctl does no curve math, so whatever this
-    writes is what reaches the card.
+    writes is what reaches the card. It also refuses a `spent: true` slot — see
+    the `spent` row below.
   - `parseCardFile(stringOrObject)` — **card → mint.** Returns a `CardFile`
     whose `slots` feed `reconstructProofsFromCard` directly, with no field
     renaming in between. Throws on anything malformed; a card file is an
@@ -43,7 +45,9 @@
     useful partial success.
 
   Also exported: `parseCardSlot`, `cardFileTotal`, `CARD_FILE_VERSION` and the
-  `CardFile` type.
+  `CardFile` and `CardFileSlot` types. `cardFileTotal` sums the **unspent**
+  slots only: a spent proof is money already gone, and this number is what a
+  terminal shows a holder as the card's worth.
 
   The wire shape carries the *card's* vocabulary — `nonce`, not `secret`, and
   `keysetId` as 16 hex chars — because that is what the card stores. A file that
@@ -55,12 +59,16 @@
   | Refused | Because |
   |---|---|
   | An unknown field | A future cardctl added it and forgot to bump `version`; dropping it silently is the drift `version` exists to announce |
-  | A `note` that is not a string | Same drift, on a known field — and `note` is the file's only provenance record |
+  | A `note` that is not a string, or is over 512 characters | Same drift, on a known field — and `note` is the file's only provenance record, third-party data a terminal renders back to a human |
   | An off-curve or bad-prefix `C` / `cardPubkey` | Produces a proof that was never spendable; cardctl cannot catch it |
   | A non-v0 or half-length `keysetId` | Matches no keyset at the mint |
   | An amount that is not a positive power of two | A mint keyset has no key for 3 |
+  | An amount of `2^32` or more | `LOAD_PROOF` carries the amount as a 4-byte unsigned integer, so a larger one cannot be written to a card even though it is a valid denomination elsewhere |
+  | A missing or non-boolean `spent` | Required, never defaulted: defaulting to `false` silently resurrects a spent proof as spendable on the next load |
   | **The same `C` in two slots** | Every per-slot check passes and both copies load; slot 0 redeems, slot 1 burns on `SPEND_PROOF` and the mint refuses it as already spent, while `cardFileTotal` claimed the card held double |
+  | **The same `nonce` in two slots** | The secret is `buildP2PKSecret(nonce, cardPubkey)` and nothing else, so two slots sharing a nonce reconstruct to one proof — same `Y` at the mint — even with different amounts and therefore different `C`. Same burn as the row above, one field over |
   | A mint URL the HTTP sanitiser refuses | A bearer instrument's file is third-party data — it can carry a link-local or metadata URL |
+  | A `spent: true` slot, **in the writer only** | `parseCardFile` keeps the bit because a card dump is where it comes from, but `LOAD_PROOF` has no spent bit: re-serializing a dump (the "top up an existing card" flow) would write spent proofs back and the card would return them as spendable. Filter them out before serializing |
 
 ### Changed
 

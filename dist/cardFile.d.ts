@@ -48,7 +48,7 @@ export declare const parseCardSlot: (value: unknown, index: number) => CardFileS
  * malformed — a card file is an instruction to move money onto or off a bearer
  * card, so there is no useful partial success here.
  */
-export declare const parseCardFile: (input: string | unknown) => CardFile;
+export declare const parseCardFile: (input: unknown) => CardFile;
 /**
  * Serialize a card file.
  *
@@ -62,9 +62,23 @@ export declare const parseCardFile: (input: string | unknown) => CardFile;
  *
  * Reusing the redeem path rather than restating its rules is the point: what
  * this writes is, by construction, what that reads.
+ *
+ * A `spent: true` slot is refused here, and only here. `parseCardFile` keeps
+ * the bit because a card *dump* is where it comes from — that is the whole
+ * reason the field exists. But this direction ends at `LOAD_PROOF`, which has
+ * no spent bit, so a spent slot written back onto a card returns as unspent
+ * and inflates the balance with money that is already gone. Filter the spent
+ * slots out before calling this; dropping them silently here would be the same
+ * repair-instead-of-refuse the rest of the module declines to do.
  */
 export declare const serializeCardFile: (file: Omit<CardFile, "version">, { pretty }?: {
     pretty?: boolean;
 }) => string;
-/** Total value in a card file, in the file's `unit`. */
+/**
+ * Spendable value in a card file, in the file's `unit`.
+ *
+ * Spent slots are excluded. They are money that is already gone, and this
+ * number is what a terminal shows a holder as the card's worth — counting them
+ * is the same overstatement the duplicate-`C` check exists to prevent.
+ */
 export declare const cardFileTotal: (file: CardFile) => number;

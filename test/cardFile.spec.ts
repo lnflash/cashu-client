@@ -9,6 +9,8 @@ import {
   serializeCardFile,
 } from "../src"
 import type { CardFile, CardFileSlot } from "../src"
+import { readFileSync } from "node:fs"
+import { resolve } from "node:path"
 
 // Real secp256k1 points: reconstructProofFromCard checks curve membership,
 // so placeholder hex would fail there rather than in the parser under test.
@@ -19,6 +21,11 @@ const REAL_C = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709e
 // share one is the duplicate-proof file parseCardFile now refuses.
 const REAL_C2 = "02fe8d1eb1bcb3432b1db5833ff5f2226d9cb5e65cee430558c18ed3a3c86ce1af"
 const REAL_C3 = "03d528ecd9b696b54c907a9ed045447a79bb408ec39b68df504bb51f459bc3ffc9"
+// Further nonces, for the same reason the C constants exist: the secret is
+// derived from `buildP2PKSecret(nonce, cardPubkey)` and nothing else, so two
+// slots sharing a nonce are one proof twice — the file parseCardFile refuses.
+const NONCE2 = "cd".repeat(32)
+const NONCE3 = "ab".repeat(32)
 // On-prefix, off-curve: the shape a prefix-only check waves through.
 const OFF_CURVE = "02" + "ff".repeat(32)
 
@@ -205,8 +212,54 @@ describe("parseCardFile", () => {
 
     it("a duplicate that is not adjacent, naming the later index", () => {
       expect(() =>
-        parseCardFile(file({ slots: [slot(), slot({ C: REAL_C2 }), slot({ C: REAL_C })] })),
+        parseCardFile(
+          file({
+            slots: [
+              slot(),
+              slot({ C: REAL_C2, nonce: NONCE2 }),
+              slot({ C: REAL_C, nonce: NONCE3 }),
+            ],
+          }),
+        ),
       ).toThrow(/slot 2: duplicates an earlier slot's C/)
+    })
+
+    // The duplicate-C guard's blind spot, one field over. The secret is
+    // `buildP2PKSecret(nonce, cardPubkey)` and nothing else, so two slots with
+    // the same nonce reconstruct to the same secret and therefore the same `Y`
+    // at the mint. Different amounts give them different `C`, so every
+    // per-slot check and the duplicate-C guard both pass — and the mint sees
+    // one proof twice: the first redeems, the second is refused as already
+    // spent, after SPEND_PROOF burned the slot.
+    it("the same nonce in two slots even when C and amount differ", () => {
+      const dup = file({ slots: [slot(), slot({ amount: 16, C: REAL_C2 })] })
+      expect(() => parseCardFile(dup)).toThrow(
+        /slot 1: duplicates an earlier slot's nonce/,
+      )
+      expect(() => parseCardFile(dup)).toThrow(/the mint sees one proof twice/)
+      expect(() => parseCardFile(dup)).toThrow(CashuInvalidProofError)
+    })
+
+    it("a duplicate nonce that is not adjacent, naming the later index", () => {
+      expect(() =>
+        parseCardFile(
+          file({
+            slots: [
+              slot(),
+              slot({ C: REAL_C2, nonce: NONCE2 }),
+              slot({ amount: 16, C: REAL_C3 }),
+            ],
+          }),
+        ),
+      ).toThrow(/slot 2: duplicates an earlier slot's nonce/)
+    })
+
+    // Belt and braces: the write direction must not hand a card a file whose
+    // slots collapse to one proof either.
+    it("a duplicate nonce is refused by the writer too", () => {
+      expect(() =>
+        serializeCardFile(file({ slots: [slot(), slot({ amount: 16, C: REAL_C2 })] })),
+      ).toThrow(/slot 1: duplicates an earlier slot's nonce/)
     })
 
     it("a note that is not a string", () => {
@@ -217,6 +270,25 @@ describe("parseCardFile", () => {
       expect(() => parseCardFile(invalidFile({ note: { at: "till 2" } }))).toThrow(
         /note must be a string when present/,
       )
+    })
+
+    // `note` is third-party data off a bearer instrument like every other
+    // field here, and it is the one a terminal renders back to a human.
+    // Unbounded, `serializeCardFile` faithfully re-emits megabytes of it.
+    it("a note longer than the bound", () => {
+      expect(() => parseCardFile(file({ note: "x".repeat(513) }))).toThrow(
+        /note must be at most 512 characters, got 513/,
+      )
+      expect(() => parseCardFile(file({ note: "x".repeat(513) }))).toThrow(
+        CashuInvalidProofError,
+      )
+      expect(() => serializeCardFile(file({ note: "x".repeat(513) }))).toThrow(
+        /note must be at most 512 characters/,
+      )
+    })
+
+    it("accepts a note exactly at the bound", () => {
+      expect(parseCardFile(file({ note: "x".repeat(512) })).note).toHaveLength(512)
     })
 
     it("a unit that is only whitespace", () => {
@@ -362,7 +434,11 @@ describe("serializeCardFile", () => {
         [
           "several denominations",
           file({
-            slots: [slot(), slot({ amount: 16, C: REAL_C2 }), slot({ amount: 1, C: REAL_C3 })],
+            slots: [
+              slot(),
+              slot({ amount: 16, C: REAL_C2, nonce: NONCE2 }),
+              slot({ amount: 1, C: REAL_C3, nonce: NONCE3 }),
+            ],
           }),
         ],
         ["upper-case hex", file({ cardPubkey: CARD_PUBKEY.toUpperCase() })],
@@ -438,7 +514,7 @@ describe("the card → mint direction", () => {
     // This is the whole point of the format: what cardctl dumps is what the
     // mint side reconstructs, with no field renaming in between.
     const parsed = parseCardFile(
-      file({ slots: [slot(), slot({ amount: 16, nonce: "cd".repeat(32), C: REAL_C2 })] }),
+      file({ slots: [slot(), slot({ amount: 16, nonce: NONCE2, C: REAL_C2 })] }),
     )
     const proofs = reconstructProofsFromCard(parsed.slots, parsed.cardPubkey)
 
@@ -455,9 +531,11 @@ describe("the spent bit", () => {
   // written back onto a card returns as unspent and inflates the balance with
   // money that is already gone. The file is the only place it can live, which
   // is why it is required rather than defaulted.
-  it("round-trips both values", () => {
+  it("round-trips both values on read — a dump is where the bit comes from", () => {
     const parsed = parseCardFile(
-      file({ slots: [slot({ spent: false }), slot({ spent: true, C: REAL_C2 })] }),
+      file({
+        slots: [slot({ spent: false }), slot({ spent: true, C: REAL_C2, nonce: NONCE2 })],
+      }),
     )
     expect(parsed.slots.map(s => s.spent)).toEqual([false, true])
   })
@@ -478,11 +556,72 @@ describe("the spent bit", () => {
     },
   )
 
-  it("survives serialization", () => {
-    const written = serializeCardFile(
-      file({ slots: [slot({ spent: true })] }) as Omit<CardFile, "version">,
+  // The bit only travels card → mint. `LOAD_PROOF` has no spent field, so a
+  // spent slot written back onto a card returns as spendable — the "top up an
+  // existing card" flow (dump, append, re-serialize) is exactly how that
+  // happens. The writer refuses rather than silently dropping the slot: the
+  // caller has to say which proofs it means to load.
+  it("is refused by the writer, naming the offending slot", () => {
+    expect(() =>
+      serializeCardFile(
+        file({ slots: [slot({ spent: true })] }) as Omit<CardFile, "version">,
+      ),
+    ).toThrow(/slot 0: cannot write a spent slot to a card/)
+    expect(() =>
+      serializeCardFile(
+        file({ slots: [slot({ spent: true })] }) as Omit<CardFile, "version">,
+      ),
+    ).toThrow(CashuInvalidProofError)
+  })
+
+  it("names the spent slot's index in a mixed card", () => {
+    expect(() =>
+      serializeCardFile(
+        file({
+          slots: [slot(), slot({ spent: true, C: REAL_C2, nonce: NONCE2 })],
+        }) as Omit<CardFile, "version">,
+      ),
+    ).toThrow(/slot 1: cannot write a spent slot to a card/)
+  })
+
+  it("writes fine once the spent slots are dropped", () => {
+    const dumped = parseCardFile(
+      file({
+        slots: [slot({ spent: true }), slot({ amount: 16, C: REAL_C2, nonce: NONCE2 })],
+      }),
     )
-    expect(parseCardFile(written).slots[0].spent).toBe(true)
+    const written = serializeCardFile({
+      ...dumped,
+      slots: dumped.slots.filter(s => !s.spent),
+    })
+    expect(parseCardFile(written).slots).toHaveLength(1)
+    expect(parseCardFile(written).slots[0].spent).toBe(false)
+  })
+
+  // The reason the bit exists at all: a spent proof is money already gone, so
+  // it must not be counted as the card's worth.
+  it("is excluded from cardFileTotal", () => {
+    const parsed = parseCardFile(
+      file({
+        slots: [
+          slot({ spent: true }),
+          slot({ amount: 16, spent: false, C: REAL_C2, nonce: NONCE2 }),
+        ],
+      }),
+    )
+    expect(cardFileTotal(parsed)).toBe(16)
+  })
+
+  it("reports zero for a fully spent card", () => {
+    const parsed = parseCardFile(
+      file({
+        slots: [
+          slot({ spent: true }),
+          slot({ amount: 16, spent: true, C: REAL_C2, nonce: NONCE2 }),
+        ],
+      }),
+    )
+    expect(cardFileTotal(parsed)).toBe(0)
   })
 })
 
@@ -532,6 +671,49 @@ describe("cross-repo contract", () => {
   it("refuses a field the schema does not publish", () => {
     expect(() => parseCardFile(file({ slots: [{ ...slot(), extra: 1 } as never] }))).toThrow(
       /unknown field\(s\): extra/,
+    )
+  })
+})
+
+describe("the published examples", () => {
+  // The README block is the canonical example of this schema, and the Python
+  // side reads these docs. An example the parser refuses teaches the wrong
+  // shape to the only other implementation. Extracted and parsed rather than
+  // eyeballed, so it cannot drift from the code again.
+  const jsonBlock = (path: string): unknown => {
+    const doc = readFileSync(resolve(__dirname, "..", path), "utf8")
+    const match = doc.match(/```jsonc\n([\s\S]*?)```/)
+    if (!match) throw new Error(`no jsonc block in ${path}`)
+    // CHANGELOG annotates its block with // comments and … elisions; strip the
+    // comments so the shape underneath is still checkable field-for-field.
+    // Only a `//` preceded by whitespace or line start — the one inside
+    // "https://forge.flashapp.me" is preceded by a colon and must survive.
+    return JSON.parse(match[1].replace(/(^|\s)\/\/.*$/gm, ""))
+  }
+
+  it("the README example parses", () => {
+    const parsed = parseCardFile(jsonBlock("README.md"))
+    expect(parsed.slots).toHaveLength(1)
+    expect(parsed.slots[0].spent).toBe(false)
+    expect(cardFileTotal(parsed)).toBe(8)
+  })
+
+  it("the README example round-trips through the writer", () => {
+    const parsed = parseCardFile(jsonBlock("README.md"))
+    expect(() => serializeCardFile(parsed)).not.toThrow()
+  })
+
+  // The CHANGELOG block uses `03…` placeholders rather than real points, so it
+  // cannot go through parseCardFile. What it can be held to is the field set —
+  // which is what drifted.
+  it("the CHANGELOG example lists exactly the published fields", () => {
+    const doc = jsonBlock("CHANGELOG.md") as Record<string, unknown>
+    expect(Object.keys(doc).sort()).toEqual(
+      ["version", "mint", "unit", "cardPubkey", "slots", "note"].sort(),
+    )
+    const [changelogSlot] = doc.slots as Record<string, unknown>[]
+    expect(Object.keys(changelogSlot).sort()).toEqual(
+      ["keysetId", "amount", "nonce", "C", "spent"].sort(),
     )
   })
 })

@@ -69,7 +69,8 @@ slot on `SPEND_PROOF`.
       "keysetId": "0059534ce0bfa19a",
       "amount": 8,
       "nonce": "916c21b8c67da71e9d02f4e3adc6f30700c152e01a07ae30e3bcc6b55b0c9e5e",
-      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+      "C": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "spent": false
     }
   ],
   "note": "loaded at till 2"
@@ -82,6 +83,7 @@ import {
   parseCardFile,
   cardFileTotal,
   reconstructProofsFromCard,
+  sanitizeMintUrl,
 } from "@lnflash/cashu-client"
 
 // mint → card: hand this to cardctl to load. `blindingData` is what
@@ -96,15 +98,19 @@ const json = serializeCardFile({
     amount: p.amount,
     nonce: blindingData[i].nonce, // the 32-byte nonce, not the ~150-byte secret
     C: p.C,
+    spent: false, // required; the writer refuses a true
   })),
   note: "loaded at till 2",
 })
 
-// card → mint: what cardctl dumped, ready to spend.
+// card → mint: what cardctl dumped, ready to spend. Compare against the
+// *sanitised* URL — `card.mint` comes back canonical, and a raw constant with
+// a trailing slash would reject a card from the right mint.
 const card = parseCardFile(await fs.readFile("card.json", "utf8"))
-if (card.mint !== MINT_URL) throw new Error("card is from a different mint")
-const spendable = reconstructProofsFromCard(card.slots, card.cardPubkey)
-console.log(`${cardFileTotal(card)} ${card.unit} across ${card.slots.length} slots`)
+if (card.mint !== sanitizeMintUrl(MINT_URL)) throw new Error("card is from a different mint")
+const unspent = card.slots.filter(s => !s.spent)
+const spendable = reconstructProofsFromCard(unspent, card.cardPubkey)
+console.log(`${cardFileTotal(card)} ${card.unit} across ${unspent.length} slots`)
 ```
 
 **The wire shape is the card's vocabulary, not `CashuProof`'s.** `nonce`, not
@@ -121,14 +127,27 @@ off-curve `C` would otherwise load fine, burn the slot on `SPEND_PROOF`, and be
 rejected by the mint as a proof that was never spendable.
 
 **Both directions refuse rather than repair.** Unknown fields (bump `version`
-instead of adding one silently), a `note` that is not a string, a non-v0 or
-half-length `keysetId`, an amount that is not a positive power of two, a mint
-URL the HTTP sanitiser refuses, and — the one shape every per-slot check
-otherwise waves through — **the same `C` in two slots**. Duplicate slots both
-load; the first redeems, the second burns on `SPEND_PROOF` and comes back
-already-spent, while `cardFileTotal` told the holder the card was worth double.
-`mint` and `unit` come back canonicalised, so the `card.mint !== MINT_URL`
-comparison above is not defeated by a trailing slash.
+instead of adding one silently), a `note` that is not a string or is over 512
+characters, a non-v0 or half-length `keysetId`, an amount that is not a positive
+power of two or is `2^32` or larger (`LOAD_PROOF` carries it as four bytes), a
+missing or non-boolean `spent`, a mint URL the HTTP sanitiser refuses, and — the
+shapes every per-slot check otherwise waves through — **the same `C` in two
+slots** or **the same `nonce` in two slots**. Either way both copies load; the
+first redeems, the second burns on `SPEND_PROOF` and comes back already-spent,
+while `cardFileTotal` told the holder the card was worth double. `C` repeats are
+the same signature twice; `nonce` repeats are subtler, since the secret is
+derived from the nonce and the card key alone, so two slots with one nonce
+reconstruct to one proof even when their amounts and `C` values differ.
+`mint` and `unit` come back canonicalised, so the comparison above is not
+defeated by a trailing slash — on either side, which is why `MINT_URL` goes
+through `sanitizeMintUrl` too.
+
+**`spent` travels card → mint only.** `parseCardFile` keeps it because a card
+dump is where it comes from; `serializeCardFile` refuses a `spent: true` slot,
+because `LOAD_PROOF` has no spent bit and a spent proof written back onto a card
+returns as spendable. Filter them out before serializing — topping up an
+existing card is dump, drop the spent slots, append, write. `cardFileTotal`
+counts only the unspent slots, for the same reason.
 
 Five things worth knowing before wiring this up.
 

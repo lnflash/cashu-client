@@ -44,6 +44,8 @@ import {
   requirePoint,
 } from "./card"
 import type { CardProofSlot } from "./card"
+import { CashuInvalidProofError } from "./errors"
+import { sanitizeMintUrl } from "./http"
 
 /**
  * A slot as it appears in a card file: everything reconstruction needs, plus
@@ -68,8 +70,15 @@ export type CardFileSlot = CardProofSlot & {
  * before a card sees it.
  */
 const MAX_CARD_AMOUNT = 2 ** 32
-import { CashuInvalidProofError } from "./errors"
-import { sanitizeMintUrl } from "./http"
+
+/**
+ * `note` is free-form provenance a terminal displays back to a human, and it
+ * arrives as third-party data off a bearer instrument like every other field
+ * here — so it is bounded like every other field here. Without a bound a card
+ * file can carry megabytes of text that `serializeCardFile` faithfully
+ * re-emits.
+ */
+const MAX_NOTE_LENGTH = 512
 
 /** Bumped only for a breaking change to the shape below. */
 export const CARD_FILE_VERSION = 1
@@ -181,7 +190,7 @@ export const parseCardSlot = (value: unknown, index: number): CardFileSlot => {
  * malformed — a card file is an instruction to move money onto or off a bearer
  * card, so there is no useful partial success here.
  */
-export const parseCardFile = (input: string | unknown): CardFile => {
+export const parseCardFile = (input: unknown): CardFile => {
   let doc: unknown = input
   if (typeof input === "string") {
     try {
@@ -235,6 +244,11 @@ export const parseCardFile = (input: string | unknown): CardFile => {
   if (raw.note !== undefined && typeof raw.note !== "string") {
     throw new CashuInvalidProofError("card file note must be a string when present")
   }
+  if (typeof raw.note === "string" && raw.note.length > MAX_NOTE_LENGTH) {
+    throw new CashuInvalidProofError(
+      `card file note must be at most ${MAX_NOTE_LENGTH} characters, got ${raw.note.length}`,
+    )
+  }
   if (!Array.isArray(raw.slots)) {
     throw new CashuInvalidProofError("card file slots must be an array")
   }
@@ -258,15 +272,33 @@ export const parseCardFile = (input: string | unknown): CardFile => {
   // unique per proof and a repeat is never a coincidence. Checked here rather
   // than in `serializeCardFile` so a card *dumped* with a duplicated slot is
   // caught on the read direction too, before anything is redeemed.
-  const seen = new Set<string>()
+  //
+  // `nonce` is deduped in the same pass and for the same reason, one field
+  // over. `buildP2PKSecret(nonce, cardPubkey)` derives the secret from nothing
+  // but those two values, so two slots sharing a nonce reconstruct to two
+  // proofs with a byte-identical `secret` — hence the same `Y` at the mint.
+  // Give them different amounts and their `C` values differ too, so every
+  // per-slot check and the duplicate-`C` guard above both pass, and the file
+  // reaches a card: the first slot redeems, the second burns on SPEND_PROOF
+  // and comes back already-spent. That is the duplicate-proof failure exactly,
+  // wearing a different field name.
+  const seenC = new Set<string>()
+  const seenNonce = new Set<string>()
   slots.forEach((s, i) => {
-    if (seen.has(s.C)) {
+    if (seenC.has(s.C)) {
       throw new CashuInvalidProofError(
         `slot ${i}: duplicates an earlier slot's C — the same proof twice burns a ` +
           `slot the mint will reject as already spent`,
       )
     }
-    seen.add(s.C)
+    if (seenNonce.has(s.nonce)) {
+      throw new CashuInvalidProofError(
+        `slot ${i}: duplicates an earlier slot's nonce — both slots reconstruct to ` +
+          `the same secret, so the mint sees one proof twice`,
+      )
+    }
+    seenC.add(s.C)
+    seenNonce.add(s.nonce)
   })
 
   return {
@@ -292,16 +324,38 @@ export const parseCardFile = (input: string | unknown): CardFile => {
  *
  * Reusing the redeem path rather than restating its rules is the point: what
  * this writes is, by construction, what that reads.
+ *
+ * A `spent: true` slot is refused here, and only here. `parseCardFile` keeps
+ * the bit because a card *dump* is where it comes from — that is the whole
+ * reason the field exists. But this direction ends at `LOAD_PROOF`, which has
+ * no spent bit, so a spent slot written back onto a card returns as unspent
+ * and inflates the balance with money that is already gone. Filter the spent
+ * slots out before calling this; dropping them silently here would be the same
+ * repair-instead-of-refuse the rest of the module declines to do.
  */
 export const serializeCardFile = (
   file: Omit<CardFile, "version">,
   { pretty = true }: { pretty?: boolean } = {},
 ): string => {
   const validated = parseCardFile({ ...file, version: CARD_FILE_VERSION })
+  const spent = validated.slots.findIndex(s => s.spent)
+  if (spent !== -1) {
+    throw new CashuInvalidProofError(
+      `slot ${spent}: cannot write a spent slot to a card — LOAD_PROOF has no ` +
+        `spent bit, so the card would return it as spendable. Drop spent slots ` +
+        `before serializing.`,
+    )
+  }
   reconstructProofsFromCard(validated.slots, validated.cardPubkey)
   return JSON.stringify(validated, null, pretty ? 2 : undefined)
 }
 
-/** Total value in a card file, in the file's `unit`. */
+/**
+ * Spendable value in a card file, in the file's `unit`.
+ *
+ * Spent slots are excluded. They are money that is already gone, and this
+ * number is what a terminal shows a holder as the card's worth — counting them
+ * is the same overstatement the duplicate-`C` check exists to prevent.
+ */
 export const cardFileTotal = (file: CardFile): number =>
-  file.slots.reduce((sum, s) => sum + s.amount, 0)
+  file.slots.filter(s => !s.spent).reduce((sum, s) => sum + s.amount, 0)
