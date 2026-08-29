@@ -25,4 +25,5 @@ export type {
   ReconstructCardOptions,
 } from "./card"
 export * from "./cardFile"
+export * from "./fundCard"
 export { sanitizeMintUrl } from "./http"

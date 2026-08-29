@@ -34,5 +34,6 @@ var card_1 = require("./card");
 Object.defineProperty(exports, "reconstructProofFromCard", { enumerable: true, get: function () { return card_1.reconstructProofFromCard; } });
 Object.defineProperty(exports, "reconstructProofsFromCard", { enumerable: true, get: function () { return card_1.reconstructProofsFromCard; } });
 __exportStar(require("./cardFile"), exports);
+__exportStar(require("./fundCard"), exports);
 var http_1 = require("./http");
 Object.defineProperty(exports, "sanitizeMintUrl", { enumerable: true, get: function () { return http_1.sanitizeMintUrl; } });

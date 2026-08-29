@@ -10,4 +10,5 @@ export * from "./dleq";
 export { reconstructProofFromCard, reconstructProofsFromCard, } from "./card";
 export type { CardProofSlot, CardReconstructionResult, CardSlotFailure, ReconstructCardBatchOptions, ReconstructCardOptions, } from "./card";
 export * from "./cardFile";
+export * from "./fundCard";
 export { sanitizeMintUrl } from "./http";

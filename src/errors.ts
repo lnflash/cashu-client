@@ -23,8 +23,14 @@ export class CashuMintError extends CashuError {
   }
 }
 
-/** Quote was not paid when minting was attempted */
-export class CashuMintQuoteNotPaidError extends CashuError {
+/**
+ * Quote was not paid when minting was attempted.
+ *
+ * Extends CashuMintError so existing `instanceof CashuMintError` checks still
+ * catch it, while callers polling for payment can match the type instead of
+ * regexing the message.
+ */
+export class CashuMintQuoteNotPaidError extends CashuMintError {
   constructor(message = "Mint quote not paid", code = 10001) {
     super(message, code)
   }
@@ -54,6 +60,22 @@ export class CashuInvalidProofError extends CashuError {
 /** Not enough card slots available for the requested denominations */
 export class CashuInsufficientSlotsError extends CashuError {
   constructor(message = "Insufficient card slots", code = 10005) {
+    super(message, code)
+  }
+}
+
+/**
+ * A deterministic verification refusal from `completeFunding`: DLEQ
+ * verification failed, `requireDleq` refused a signature with no DLEQ, or the
+ * keyset published no key for an output amount.
+ *
+ * Unlike transport blips, retrying with the same pending state will fail
+ * identically — callers polling with retry loops should fail fast on this
+ * instead of re-minting and re-verifying. Extends CashuMintError so existing
+ * `instanceof CashuMintError` checks still catch it.
+ */
+export class CashuVerificationError extends CashuMintError {
+  constructor(message = "Verification failed", code = 10007) {
     super(message, code)
   }
 }
