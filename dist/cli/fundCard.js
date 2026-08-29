@@ -34,6 +34,8 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.MAX_CONSECUTIVE_FAILURES = exports.POLL_INTERVAL_MS = exports.FundCardCliError = void 0;
+exports.runFundCard = runFundCard;
 /**
  * fund-card — turn money at the mint into a card file.
  *
@@ -49,8 +51,12 @@ Object.defineProperty(exports, "__esModule", { value: true });
  * and a crash at any later point is recovered by re-running the same command:
  * the pending file is detected and funding resumes from it (NUT-04 lets the
  * same quote and outputs be re-submitted).
+ *
+ * The flow lives in `runFundCard` with an injectable io surface (fs, output,
+ * clock, sleep) so the money-safety ordering above is testable; `main` only
+ * parses argv and wires the real io.
  */
-const fs = __importStar(require("fs"));
+const nodeFs = __importStar(require("fs"));
 const fundCard_1 = require("../fundCard");
 const errors_1 = require("../errors");
 const USAGE = `usage: fund-card --mint <url> --amount <n> --card-pubkey <hex>
@@ -60,6 +66,10 @@ const USAGE = `usage: fund-card --mint <url> --amount <n> --card-pubkey <hex>
 Writes a card file of P2PK-locked proofs for the card, ready for
 \`cardctl load-file\`. Re-running with the same --out resumes an
 interrupted funding from its .pending.json.`;
+/** A fatal CLI condition: `runFundCard` throws it, `main` prints it and exits 1. */
+class FundCardCliError extends Error {
+}
+exports.FundCardCliError = FundCardCliError;
 function die(message) {
     process.stderr.write(message + "\n");
     process.exit(1);
@@ -109,49 +119,82 @@ function parseArgs(argv) {
         force: flags.has("force"),
     };
 }
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-async function main() {
-    const args = parseArgs(process.argv.slice(2));
+const defaultIo = () => ({
+    fs: nodeFs,
+    stdout: text => process.stdout.write(text),
+    stderr: text => process.stderr.write(text),
+    sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+    now: () => Date.now(),
+});
+/** Poll interval while waiting for the invoice to be paid. */
+exports.POLL_INTERVAL_MS = 5000;
+/**
+ * Consecutive non-"not paid" failures tolerated while polling before dying.
+ * A transient network blip on the quote-state GET must not kill an unattended
+ * funding mid-wait; a persistent failure still surfaces after this many tries
+ * (the pending file survives either way, so nothing is lost — only unattended).
+ */
+exports.MAX_CONSECUTIVE_FAILURES = 3;
+async function runFundCard(args, io = defaultIo()) {
+    const fail = (message) => {
+        throw new FundCardCliError(message);
+    };
     const pendingPath = args.out + ".pending.json";
     let pending;
-    if (fs.existsSync(pendingPath)) {
+    if (io.fs.existsSync(pendingPath)) {
         // A previous run got as far as persisting the quote. That state is the
         // only copy of the blinding data — resume from it, never re-quote.
-        process.stderr.write(`resuming from ${pendingPath}\n`);
-        pending = JSON.parse(fs.readFileSync(pendingPath, "utf-8"));
+        pending = JSON.parse(io.fs.readFileSync(pendingPath, "utf-8"));
         if (pending.version !== 1)
-            die(`${pendingPath}: unsupported pending version`);
+            fail(`${pendingPath}: unsupported pending version`);
         if (pending.cardPubkey !== args.cardPubkey) {
-            die(`${pendingPath} is for card ${pending.cardPubkey}, not ${args.cardPubkey}.\n` +
+            fail(`${pendingPath} is for card ${pending.cardPubkey}, not ${args.cardPubkey}.\n` +
                 `Finish or remove it before funding a different card to the same --out.`);
         }
+        // A resume ignores --amount and re-uses the persisted quote, so the flags
+        // must not silently disagree with it: resuming "5000 sat at mint B" from a
+        // pending file for "500 sat at mint A" would fund the wrong thing.
+        if (pending.mintUrl !== args.mint) {
+            fail(`${pendingPath} is a pending funding at ${pending.mintUrl}, not ${args.mint}.\n` +
+                `Finish it (re-run with --mint ${pending.mintUrl}) or remove it to start over.`);
+        }
+        if (pending.unit !== args.unit) {
+            fail(`${pendingPath} is a pending funding in ${pending.unit}, not ${args.unit}.\n` +
+                `Finish it (re-run with --unit ${pending.unit}) or remove it to start over.`);
+        }
+        const pendingAmount = pending.outputs.reduce((sum, o) => sum + o.amount, 0);
+        io.stderr(`resuming from ${pendingPath}: ${pendingAmount} ${pending.unit} at ` +
+            `${pending.mintUrl} (quote ${pending.quoteId})\n`);
     }
     else {
-        if (fs.existsSync(args.out) && !args.force) {
-            die(`${args.out} already exists; pass --force to overwrite`);
+        if (io.fs.existsSync(args.out) && !args.force) {
+            fail(`${args.out} already exists; pass --force to overwrite`);
         }
         const prepared = await (0, fundCard_1.prepareFunding)(args.mint, args.amount, args.unit, args.cardPubkey, { maxSlots: args.maxSlots });
         if (prepared instanceof errors_1.CashuMintError)
-            die(prepared.message);
+            fail(prepared.message);
         pending = prepared;
         // Before the invoice is shown, atomically: write-then-rename so a crash
         // mid-write cannot leave a truncated pending file that resumes wrong.
-        fs.writeFileSync(pendingPath + ".tmp", JSON.stringify(pending, null, 2));
-        fs.renameSync(pendingPath + ".tmp", pendingPath);
-        process.stdout.write(`\nPay this invoice (${args.amount} ${args.unit}):\n\n` +
+        io.fs.writeFileSync(pendingPath + ".tmp", JSON.stringify(pending, null, 2));
+        io.fs.renameSync(pendingPath + ".tmp", pendingPath);
+        io.stdout(`\nPay this invoice (${args.amount} ${args.unit}):\n\n` +
             `${pending.paymentRequest}\n\n` +
             `Blinding state saved to ${pendingPath} — do not delete it until the\n` +
             `card file is written; after payment it is the only way to recover.\n\n`);
     }
     // Poll until paid. completeFunding checks the state itself, so the loop just
-    // keeps trying it; a not-paid result is distinguishable by message.
+    // keeps trying it; a not-paid result is a typed CashuMintQuoteNotPaidError.
     const deadline = pending.expiry * 1000;
+    let consecutiveFailures = 0;
     for (;;) {
         const result = await (0, fundCard_1.completeFunding)(pending, { requireDleq: args.requireDleq });
         if (!(result instanceof errors_1.CashuMintError)) {
-            fs.writeFileSync(args.out, result.cardFile + "\n");
-            fs.unlinkSync(pendingPath);
-            process.stdout.write(`\nwrote ${args.out}: ${result.amounts.length} proof(s), ` +
+            // Ordering is money safety: the card file must exist on disk before the
+            // pending file — the only recovery artifact — is deleted.
+            io.fs.writeFileSync(args.out, result.cardFile + "\n");
+            io.fs.unlinkSync(pendingPath);
+            io.stdout(`\nwrote ${args.out}: ${result.amounts.length} proof(s), ` +
                 `${result.total} ${pending.unit} total` +
                 (result.missingDleq > 0
                     ? `\nwarning: ${result.missingDleq} signature(s) carried no DLEQ ` +
@@ -160,14 +203,31 @@ async function main() {
                 `\n\nnext: cardctl load-file ${args.out}\n`);
             return;
         }
-        if (!/not PAID/.test(result.message))
-            die(result.message);
-        if (Date.now() > deadline) {
-            die(`quote expired unpaid. ${pendingPath} is kept for the record; remove it ` +
-                `to start over.`);
+        if (result instanceof errors_1.CashuMintQuoteNotPaidError) {
+            consecutiveFailures = 0;
+            if (io.now() > deadline) {
+                fail(`quote expired unpaid. ${pendingPath} is kept for the record; remove it ` +
+                    `to start over.`);
+            }
+            io.stderr("waiting for payment…\n");
         }
-        process.stderr.write("waiting for payment…\n");
-        await sleep(5000);
+        else {
+            // Anything else may be a transient blip (mint unreachable, timeout).
+            // Retry a bounded number of times; the pending file survives regardless.
+            consecutiveFailures += 1;
+            if (consecutiveFailures >= exports.MAX_CONSECUTIVE_FAILURES) {
+                fail(`${result.message}\n(giving up after ${consecutiveFailures} consecutive ` +
+                    `failures; ${pendingPath} is kept — re-run to resume)`);
+            }
+            io.stderr(`mint error (will retry): ${result.message}\n`);
+        }
+        await io.sleep(exports.POLL_INTERVAL_MS);
     }
 }
-main().catch(error => die(error instanceof Error ? error.message : String(error)));
+async function main() {
+    await runFundCard(parseArgs(process.argv.slice(2)));
+}
+/* istanbul ignore next -- entrypoint wiring, exercised only as a binary */
+if (require.main === module) {
+    main().catch(error => die(error instanceof Error ? error.message : String(error)));
+}

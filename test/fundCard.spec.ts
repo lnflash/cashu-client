@@ -17,6 +17,7 @@ import * as secp from "tiny-secp256k1"
 
 import {
   CashuMintError,
+  CashuMintQuoteNotPaidError,
   cardFileTotal,
   completeFunding,
   hashToCurve,
@@ -132,6 +133,28 @@ describe("prepareFunding", () => {
     expect(result).toBeInstanceOf(CashuMintError)
   })
 
+  it("refuses BEFORE requesting a quote when the keyset lacks a key for a denomination", async () => {
+    installMint()
+    const base = mockAxios.getMockImplementation()!
+    mockAxios.mockImplementation((method: string, url: string, body?: unknown) => {
+      if (method === "get" && String(url).includes("/v1/keys/")) {
+        // Publishes a key for 1 but not for 8 — 9 = 1 + 8 needs both.
+        return Promise.resolve({data: {keysets: [{id: KEYSET_ID, unit: "sat",
+          keys: {"1": makeMint().AHex}}]}})
+      }
+      return base(method, url, body)
+    })
+
+    const result = await prepareFunding(MINT_URL, 9, "sat", CARD)
+    expect(result).toBeInstanceOf(CashuMintError)
+    expect((result as CashuMintError).message).toMatch(/no key for denomination\(s\) 8/)
+    // No quote was requested: no invoice exists, so no money can get stuck.
+    const quotePosts = mockAxios.mock.calls.filter(
+      ([method, url]) => method === "post" && String(url).endsWith("/v1/mint/quote/bolt11"),
+    )
+    expect(quotePosts).toHaveLength(0)
+  })
+
   it("passes a quote failure through without minting anything", async () => {
     mockAxios.mockImplementation((method: string, url: string) => {
       if (method === "get" && url.endsWith("/v1/keysets")) {
@@ -198,6 +221,8 @@ describe("completeFunding", () => {
 
     const result = await completeFunding(pending)
     expect(result).toBeInstanceOf(CashuMintError)
+    // Typed, not just a message: callers polling for payment match on this.
+    expect(result).toBeInstanceOf(CashuMintQuoteNotPaidError)
     expect((result as CashuMintError).message).toMatch(/not PAID/)
     expect(pending).toEqual(before) // untouched — retry later with the same state
 

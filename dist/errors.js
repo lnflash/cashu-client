@@ -22,8 +22,14 @@ class CashuMintError extends CashuError {
     }
 }
 exports.CashuMintError = CashuMintError;
-/** Quote was not paid when minting was attempted */
-class CashuMintQuoteNotPaidError extends CashuError {
+/**
+ * Quote was not paid when minting was attempted.
+ *
+ * Extends CashuMintError so existing `instanceof CashuMintError` checks still
+ * catch it, while callers polling for payment can match the type instead of
+ * regexing the message.
+ */
+class CashuMintQuoteNotPaidError extends CashuMintError {
     constructor(message = "Mint quote not paid", code = 10001) {
         super(message, code);
     }

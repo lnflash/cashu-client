@@ -23,8 +23,14 @@ export class CashuMintError extends CashuError {
   }
 }
 
-/** Quote was not paid when minting was attempted */
-export class CashuMintQuoteNotPaidError extends CashuError {
+/**
+ * Quote was not paid when minting was attempted.
+ *
+ * Extends CashuMintError so existing `instanceof CashuMintError` checks still
+ * catch it, while callers polling for payment can match the type instead of
+ * regexing the message.
+ */
+export class CashuMintQuoteNotPaidError extends CashuMintError {
   constructor(message = "Mint quote not paid", code = 10001) {
     super(message, code)
   }

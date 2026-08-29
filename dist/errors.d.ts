@@ -11,8 +11,14 @@ export declare class CashuError extends Error {
 export declare class CashuMintError extends CashuError {
     constructor(message?: string, code?: number);
 }
-/** Quote was not paid when minting was attempted */
-export declare class CashuMintQuoteNotPaidError extends CashuError {
+/**
+ * Quote was not paid when minting was attempted.
+ *
+ * Extends CashuMintError so existing `instanceof CashuMintError` checks still
+ * catch it, while callers polling for payment can match the type instead of
+ * regexing the message.
+ */
+export declare class CashuMintQuoteNotPaidError extends CashuMintError {
     constructor(message?: string, code?: number);
 }
 /** Card public key is invalid or not a valid secp256k1 point */

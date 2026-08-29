@@ -53,6 +53,18 @@ const prepareFunding = async (mintUrl, amount, unit, cardPubkey, { maxSlots = 32
     catch (error) {
         return new errors_1.CashuMintError(error.message);
     }
+    // Verify the keyset actually publishes a key for every denomination BEFORE
+    // requesting a quote. A missing key would otherwise only surface in
+    // completeFunding — after the invoice is paid — leaving funds stuck at the
+    // mint until its keyset changes. Refuse here, while no money has moved.
+    const keyset = await (0, mint_1.getMintKeyset)(mintUrl, keysetId);
+    if (keyset instanceof errors_1.CashuMintError)
+        return keyset;
+    const unkeyed = denominations.filter(d => !keyset.keys[String(d)]);
+    if (unkeyed.length > 0) {
+        return new errors_1.CashuMintError(`mint keyset ${keysetId} publishes no key for denomination(s) ` +
+            `${[...new Set(unkeyed)].join(", ")} — refusing before any money moves`);
+    }
     const quote = await (0, mint_1.requestMintQuote)(mintUrl, amount, unit);
     if (quote instanceof errors_1.CashuMintError)
         return quote;
@@ -100,7 +112,7 @@ const completeFunding = async (pending, { requireDleq = false } = {}) => {
     if (state instanceof errors_1.CashuMintError)
         return state;
     if (state.state !== "PAID" && state.state !== "ISSUED") {
-        return new errors_1.CashuMintError(`quote ${pending.quoteId} is ${state.state}, not PAID — pay the invoice first ` +
+        return new errors_1.CashuMintQuoteNotPaidError(`quote ${pending.quoteId} is ${state.state}, not PAID — pay the invoice first ` +
             `(it expires at unix ${pending.expiry})`);
     }
     const keyset = await (0, mint_1.getMintKeyset)(pending.mintUrl, pending.keysetId);

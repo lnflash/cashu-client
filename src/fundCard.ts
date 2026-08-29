@@ -36,7 +36,7 @@ import {
 import { proofDLEQFromBlindSignature, verifyProofDLEQ } from "./dleq"
 import { buildP2PKSecret } from "./crypto"
 import { serializeCardFile } from "./cardFile"
-import { CashuMintError } from "./errors"
+import { CashuMintError, CashuMintQuoteNotPaidError } from "./errors"
 import type { CashuProof } from "./types"
 
 /** One blinded output, hex-only so the whole structure survives JSON. */
@@ -103,6 +103,20 @@ export const prepareFunding = async (
     denominations = splitIntoDenominations(amount, maxSlots)
   } catch (error) {
     return new CashuMintError((error as Error).message)
+  }
+
+  // Verify the keyset actually publishes a key for every denomination BEFORE
+  // requesting a quote. A missing key would otherwise only surface in
+  // completeFunding — after the invoice is paid — leaving funds stuck at the
+  // mint until its keyset changes. Refuse here, while no money has moved.
+  const keyset = await getMintKeyset(mintUrl, keysetId)
+  if (keyset instanceof CashuMintError) return keyset
+  const unkeyed = denominations.filter(d => !keyset.keys[String(d)])
+  if (unkeyed.length > 0) {
+    return new CashuMintError(
+      `mint keyset ${keysetId} publishes no key for denomination(s) ` +
+        `${[...new Set(unkeyed)].join(", ")} — refusing before any money moves`,
+    )
   }
 
   const quote = await requestMintQuote(mintUrl, amount, unit)
@@ -175,7 +189,7 @@ export const completeFunding = async (
   const state = await getMintQuoteState(pending.mintUrl, pending.quoteId)
   if (state instanceof CashuMintError) return state
   if (state.state !== "PAID" && state.state !== "ISSUED") {
-    return new CashuMintError(
+    return new CashuMintQuoteNotPaidError(
       `quote ${pending.quoteId} is ${state.state}, not PAID — pay the invoice first ` +
         `(it expires at unix ${pending.expiry})`,
     )
