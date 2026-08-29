@@ -211,6 +211,13 @@ async function runFundCard(args, io = defaultIo()) {
             }
             io.stderr("waiting for payment…\n");
         }
+        else if (result instanceof errors_1.CashuVerificationError) {
+            // Deterministic refusal (DLEQ failure, --require-dleq, keyset missing a
+            // key): re-running will fail identically, so don't retry and don't
+            // suggest resuming. The pending file is kept as the audit record.
+            fail(`${result.message}\n(this is not a transient error — re-running will fail ` +
+                `the same way; ${pendingPath} is kept for the record)`);
+        }
         else {
             // Anything else may be a transient blip (mint unreachable, timeout).
             // Retry a bounded number of times; the pending file survives regardless.

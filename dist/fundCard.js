@@ -132,7 +132,7 @@ const completeFunding = async (pending, { requireDleq = false } = {}) => {
         const output = pending.outputs[i];
         const mintKey = keyset.keys[String(output.amount)];
         if (!mintKey) {
-            return new errors_1.CashuMintError(`mint keyset ${pending.keysetId} publishes no key for amount ${output.amount}`);
+            return new errors_1.CashuVerificationError(`mint keyset ${pending.keysetId} publishes no key for amount ${output.amount}`);
         }
         const r = Buffer.from(output.r, "hex");
         let C;
@@ -155,14 +155,14 @@ const completeFunding = async (pending, { requireDleq = false } = {}) => {
                 dleq,
             };
             if (!(0, dleq_1.verifyProofDLEQ)(proof, mintKey)) {
-                return new errors_1.CashuMintError(`output ${i} (amount ${output.amount}): DLEQ verification failed — ` +
+                return new errors_1.CashuVerificationError(`output ${i} (amount ${output.amount}): DLEQ verification failed — ` +
                     `the mint signed with a key it did not publish. Refusing the whole batch.`);
             }
         }
         else {
             missingDleq += 1;
             if (requireDleq) {
-                return new errors_1.CashuMintError(`output ${i} (amount ${output.amount}) carries no DLEQ and requireDleq is set`);
+                return new errors_1.CashuVerificationError(`output ${i} (amount ${output.amount}) carries no DLEQ and requireDleq is set`);
             }
         }
         slots.push({

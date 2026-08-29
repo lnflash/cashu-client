@@ -36,7 +36,11 @@ import {
 import { proofDLEQFromBlindSignature, verifyProofDLEQ } from "./dleq"
 import { buildP2PKSecret } from "./crypto"
 import { serializeCardFile } from "./cardFile"
-import { CashuMintError, CashuMintQuoteNotPaidError } from "./errors"
+import {
+  CashuMintError,
+  CashuMintQuoteNotPaidError,
+  CashuVerificationError,
+} from "./errors"
 import type { CashuProof } from "./types"
 
 /** One blinded output, hex-only so the whole structure survives JSON. */
@@ -216,7 +220,7 @@ export const completeFunding = async (
     const output = pending.outputs[i]
     const mintKey = keyset.keys[String(output.amount)]
     if (!mintKey) {
-      return new CashuMintError(
+      return new CashuVerificationError(
         `mint keyset ${pending.keysetId} publishes no key for amount ${output.amount}`,
       )
     }
@@ -244,7 +248,7 @@ export const completeFunding = async (
         dleq,
       }
       if (!verifyProofDLEQ(proof, mintKey)) {
-        return new CashuMintError(
+        return new CashuVerificationError(
           `output ${i} (amount ${output.amount}): DLEQ verification failed — ` +
             `the mint signed with a key it did not publish. Refusing the whole batch.`,
         )
@@ -252,7 +256,7 @@ export const completeFunding = async (
     } else {
       missingDleq += 1
       if (requireDleq) {
-        return new CashuMintError(
+        return new CashuVerificationError(
           `output ${i} (amount ${output.amount}) carries no DLEQ and requireDleq is set`,
         )
       }

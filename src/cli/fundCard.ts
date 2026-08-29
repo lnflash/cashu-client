@@ -26,7 +26,11 @@ import {
   prepareFunding,
   type PendingFunding,
 } from "../fundCard"
-import { CashuMintError, CashuMintQuoteNotPaidError } from "../errors"
+import {
+  CashuMintError,
+  CashuMintQuoteNotPaidError,
+  CashuVerificationError,
+} from "../errors"
 
 const USAGE = `usage: fund-card --mint <url> --amount <n> --card-pubkey <hex>
                  [--unit sat] [--out <file>] [--max-slots 32]
@@ -225,6 +229,14 @@ export async function runFundCard(args: Args, io: FundCardIo = defaultIo()): Pro
         )
       }
       io.stderr("waiting for payment…\n")
+    } else if (result instanceof CashuVerificationError) {
+      // Deterministic refusal (DLEQ failure, --require-dleq, keyset missing a
+      // key): re-running will fail identically, so don't retry and don't
+      // suggest resuming. The pending file is kept as the audit record.
+      fail(
+        `${result.message}\n(this is not a transient error — re-running will fail ` +
+          `the same way; ${pendingPath} is kept for the record)`,
+      )
     } else {
       // Anything else may be a transient blip (mint unreachable, timeout).
       // Retry a bounded number of times; the pending file survives regardless.

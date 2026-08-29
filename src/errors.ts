@@ -65,6 +65,22 @@ export class CashuInsufficientSlotsError extends CashuError {
 }
 
 /**
+ * A deterministic verification refusal from `completeFunding`: DLEQ
+ * verification failed, `requireDleq` refused a signature with no DLEQ, or the
+ * keyset published no key for an output amount.
+ *
+ * Unlike transport blips, retrying with the same pending state will fail
+ * identically — callers polling with retry loops should fail fast on this
+ * instead of re-minting and re-verifying. Extends CashuMintError so existing
+ * `instanceof CashuMintError` checks still catch it.
+ */
+export class CashuVerificationError extends CashuMintError {
+  constructor(message = "Verification failed", code = 10007) {
+    super(message, code)
+  }
+}
+
+/**
  * A melt was executed but its quote fields could not be parsed.
  *
  * The inputs are already consumed and blind signatures cannot be re-fetched, so

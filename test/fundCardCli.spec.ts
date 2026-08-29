@@ -284,6 +284,24 @@ describe("fund-card CLI lifecycle", () => {
     expect(fs.existsSync(args.out + ".pending.json")).toBe(true)
   })
 
+  it("fails immediately on a deterministic verification refusal instead of retrying", async () => {
+    // A mint that emits no DLEQ while --require-dleq is set is a deterministic
+    // refusal: re-minting cannot change the outcome, so the CLI must die on
+    // the first attempt with no retry and no "re-run to resume" advice.
+    installMint({emitDleq: false})
+    const h = makeHarness()
+    const args = argsFor({requireDleq: true})
+
+    await expect(runFundCard(args, h.io)).rejects.toThrow(/not a transient error/)
+    expect(h.stderr.join("")).not.toMatch(/mint error \(will retry\)/)
+    const mintPosts = mockAxios.mock.calls.filter(
+      ([method, url]) => method === "post" && String(url).endsWith("/v1/mint/bolt11"),
+    )
+    expect(mintPosts).toHaveLength(1) // one attempt, never re-minted
+    expect(fs.existsSync(args.out + ".pending.json")).toBe(true)
+    expect(fs.existsSync(args.out)).toBe(false)
+  })
+
   it("refuses to overwrite an existing card file without --force", async () => {
     installMint()
     const args = argsFor()

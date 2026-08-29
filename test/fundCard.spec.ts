@@ -18,6 +18,7 @@ import * as secp from "tiny-secp256k1"
 import {
   CashuMintError,
   CashuMintQuoteNotPaidError,
+  CashuVerificationError,
   cardFileTotal,
   completeFunding,
   hashToCurve,
@@ -258,7 +259,7 @@ describe("completeFunding", () => {
     })
 
     const result = await completeFunding(pending)
-    expect(result).toBeInstanceOf(CashuMintError)
+    expect(result).toBeInstanceOf(CashuVerificationError) // deterministic: callers must not retry
     expect((result as CashuMintError).message).toMatch(/DLEQ verification failed/)
   })
 
@@ -271,7 +272,7 @@ describe("completeFunding", () => {
     expect(lenient.missingDleq).toBe(2)
 
     const strict = await completeFunding(pending, {requireDleq: true})
-    expect(strict).toBeInstanceOf(CashuMintError)
+    expect(strict).toBeInstanceOf(CashuVerificationError) // deterministic: callers must not retry
     expect((strict as CashuMintError).message).toMatch(/no DLEQ/)
   })
 
@@ -280,7 +281,7 @@ describe("completeFunding", () => {
     const pending = await prepare(8)
     pending.outputs[0].amount = 2048 // no published key in the fake keyset
     const result = await completeFunding(pending)
-    expect(result).toBeInstanceOf(CashuMintError)
+    expect(result).toBeInstanceOf(CashuVerificationError) // deterministic: callers must not retry
     expect((result as CashuMintError).message).toMatch(/no key for amount 2048/)
   })
 })
